@@ -61,7 +61,8 @@ Adding and removing links takes effect immediately — no restart, no reload.
 `bash`, `sh`, `python`, `node`, `perl`, `make`, `npm`, `docker` or `env` hands back general
 code execution, and with it the ability to write anywhere you can write. `find` will run
 arbitrary programs through `-exec`. `git` can run hooks and pagers. Prefer narrow tools, or
-write a small wrapper script in `~/tinbin` that pins the subcommands you actually want.
+write a small wrapper script in `~/tinbin` that pins the subcommands you actually want —
+[`wrappers/`](wrappers) has a read-only `git` you can link instead of the real one.
 
 ## Writing a wrapper
 
@@ -86,6 +87,48 @@ write one:
 - **Push the real guarantee downwards.** If the underlying system can enforce what you
   want — a read-only account, a restricted token — let it. The wrapper's job is then
   only to protect the credential, which is a much smaller thing to get right.
+
+## Ready-made wrappers
+
+`wrappers/` holds wrappers general enough to be worth sharing. Nothing in it is active
+until you link one in — tin never looks at that directory itself, only at `binDir`:
+
+```sh
+ln -s ~/work/tin/wrappers/git ~/tinbin/git
+```
+
+They are POSIX shell scripts with no dependencies beyond the tool they wrap, written to
+the rules above: because `PATH` is the allowlist directory, each calls the real binary by
+absolute path, chosen from a short list of the usual locations at the top of the script.
+Edit that list if yours lives somewhere else. Read the one you link before you link it —
+you are the one who ends up trusting it.
+
+### `git` — read-only git
+
+An allowlist of subcommands that only inspect a repository: `log`, `diff`, `show`,
+`status`, `grep`, `blame`, `rev-parse`, `ls-files`, `cat-file` and friends. Everything
+that writes objects, refs, the index, the working tree or the config is refused, and so
+is everything that touches the network. `branch` and `tag` are pinned to `--list` and
+`reflog` to `show`, which puts their destructive modes out of reach; `stash` is limited
+to `list` and `show`, `worktree` to `list`, `remote` to `remote -v`.
+
+The rest of the script is about the options, because git has a lot of ways to turn a read
+into an exec:
+
+- **Top-level options are refused outright.** `-c` sets any config key — a pager, an
+  alias, an external diff — and `--exec-path`, `--git-dir` and `--config-env` are no
+  better. Use `tin_run`'s `cwd` instead of `git -C`.
+- **Options that name a file to write or a program to run are refused**, including
+  through abbreviations. Git expands any unambiguous prefix, so `--open-f=/bin/sh`
+  really does reach `--open-files-in-pager`; the check compares prefixes in both
+  directions rather than matching names.
+- **Short options may not bundle a value**, since `-Sfoo` and the cluster `-vO` are the
+  same shape. Write `-S foo`. Every letter has to be safe on its own, which is all of
+  them except `-o` and `-O`.
+- **The config keys that run programs are overridden on every call** — pager, editor,
+  `diff.external`, `core.fsmonitor`, `gpg.program`, hooks path — so a repository that
+  sets one does not get to use it. `--no-optional-locks` keeps a plain `status` from
+  rewriting the index, so the read stays a read.
 
 ## Configuration
 
