@@ -1,0 +1,213 @@
+import { readFileSync, statSync } from "node:fs";
+import path from "node:path";
+import { canonicalize, expandTilde, isInside } from "./paths.ts";
+
+/**
+ * Shape of ~/.pi/agent/tin.json. Every field is optional; the defaults are the
+ * strict ones, so a missing, malformed, or partially-written config can only ever
+ * leave you more restricted than you asked for, never less.
+ */
+export interface TinConfigFile {
+	/** Directory of symlinks to the commands tin_run may execute. Default ~/tinbin */
+	binDir?: string;
+	/** Directories the model may write into. Default: the session's working directory. */
+	writeRoots?: string[];
+	/** Path segments that are never writable, at any depth inside a write root. */
+	denySegments?: string[];
+	/** Extra tool names to allow through the gate (e.g. tools from another extension). */
+	allowTools?: string[];
+	exec?: {
+		timeoutMs?: number;
+		maxOutputBytes?: number;
+		maxOutputLines?: number;
+		/** Environment variables copied from pi's own environment into the child. */
+		passEnv?: string[];
+		/** Environment variables set explicitly on the child. */
+		env?: Record<string, string>;
+	};
+}
+
+export interface TinExecPolicy {
+	timeoutMs: number;
+	maxOutputBytes: number;
+	maxOutputLines: number;
+	passEnv: string[];
+	env: Record<string, string>;
+}
+
+export interface TinPolicy {
+	/** The session's working directory, canonicalized. */
+	workspace: string;
+	/** Canonical directories the model may write into. */
+	writeRoots: string[];
+	/** Segments blocked at any depth inside a write root. */
+	denySegments: string[];
+	/** Absolute paths (and their subtrees) blocked regardless of write roots. */
+	denyPaths: string[];
+	/** Where allowed commands are symlinked from. */
+	binDir: string;
+	/** False when binDir is missing or unsafe; tin_run then refuses everything. */
+	execEnabled: boolean;
+	/** Extra tool names allowed through the gate. */
+	allowTools: string[];
+	exec: TinExecPolicy;
+	configPath: string;
+	/** Problems worth telling the user about at session start. */
+	warnings: string[];
+}
+
+export const DEFAULT_DENY_SEGMENTS = [".git", ".pi", ".agents"];
+
+const DEFAULT_PASS_ENV = ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TMPDIR"];
+
+const DEFAULT_EXEC: TinExecPolicy = {
+	timeoutMs: 120_000,
+	maxOutputBytes: 100_000,
+	maxOutputLines: 2_000,
+	passEnv: DEFAULT_PASS_ENV,
+	env: {},
+};
+
+export interface BuildPolicyOptions {
+	/** Session working directory. */
+	cwd: string;
+	/** User home, used to expand `~` and to locate the default binDir. */
+	home: string;
+	/** pi's agent config directory (~/.pi/agent), where tin.json lives. */
+	agentDir: string;
+	/** Directory holding tin's own source, which is never writable. */
+	selfDir?: string;
+	/** Override the config file location (tests). */
+	configPath?: string;
+	/** Injected for tests. */
+	readFile?: (p: string) => string;
+	isDirectory?: (p: string) => boolean;
+}
+
+function defaultIsDirectory(p: string): boolean {
+	try {
+		return statSync(p).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+function readConfigFile(
+	configPath: string,
+	readFile: (p: string) => string,
+	warnings: string[],
+): TinConfigFile {
+	let raw: string;
+	try {
+		raw = readFile(configPath);
+	} catch {
+		return {}; // No config file is the normal case.
+	}
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			warnings.push(`${configPath}: expected a JSON object, ignoring it`);
+			return {};
+		}
+		return parsed as TinConfigFile;
+	} catch (error) {
+		warnings.push(`${configPath}: ${(error as Error).message} — using defaults`);
+		return {};
+	}
+}
+
+function stringArray(value: unknown): string[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const items = value.filter((item): item is string => typeof item === "string");
+	return items.length === value.length ? items : undefined;
+}
+
+function positiveNumber(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/**
+ * Resolve the effective policy for a session.
+ *
+ * Config is read only from the user's home directory, never from the project. The
+ * model can write inside the project, so a project-local policy file would be a
+ * policy the model can edit.
+ */
+export function buildPolicy(options: BuildPolicyOptions): TinPolicy {
+	const {
+		cwd,
+		home,
+		agentDir,
+		selfDir,
+		readFile = (p: string) => readFileSync(p, "utf8"),
+		isDirectory = defaultIsDirectory,
+	} = options;
+
+	const warnings: string[] = [];
+	const configPath = options.configPath ?? path.join(agentDir, "tin.json");
+	const file = readConfigFile(configPath, readFile, warnings);
+
+	const workspace = canonicalize(cwd, cwd);
+
+	const configuredRoots = stringArray(file.writeRoots);
+	if (file.writeRoots !== undefined && configuredRoots === undefined) {
+		warnings.push(`${configPath}: writeRoots must be an array of strings — using the workspace`);
+	}
+	const rootCandidates = configuredRoots ?? [workspace];
+	const writeRoots: string[] = [];
+	for (const candidate of rootCandidates) {
+		const resolved = canonicalize(expandTilde(candidate, home), cwd);
+		if (!isDirectory(resolved)) {
+			warnings.push(`writeRoot ${candidate} is not an existing directory — dropped`);
+			continue;
+		}
+		if (!writeRoots.includes(resolved)) writeRoots.push(resolved);
+	}
+	if (writeRoots.length === 0) {
+		warnings.push("no usable write roots — all writes will be denied");
+	}
+
+	const binDir = canonicalize(expandTilde(file.binDir ?? path.join(home, "tinbin"), home), cwd);
+
+	let execEnabled = true;
+	if (!isDirectory(binDir)) {
+		execEnabled = false;
+		warnings.push(`command directory ${binDir} does not exist — tin_run has nothing to run`);
+	}
+	// A bin directory the model can write into is not an allowlist, it is a suggestion.
+	const writableBin = writeRoots.find((root) => isInside(root, binDir));
+	if (writableBin) {
+		execEnabled = false;
+		warnings.push(
+			`command directory ${binDir} is inside writable root ${writableBin} — execution disabled`,
+		);
+	}
+
+	const denySegments = stringArray(file.denySegments) ?? DEFAULT_DENY_SEGMENTS;
+
+	// Never writable, whatever the roots say: tin's own code, tin's own config, and
+	// the command allowlist. Each of these is a way to rewrite the policy itself.
+	const denyPaths = [configPath, binDir];
+	if (selfDir) denyPaths.push(canonicalize(selfDir, cwd));
+
+	const exec: TinExecPolicy = {
+		timeoutMs: positiveNumber(file.exec?.timeoutMs, DEFAULT_EXEC.timeoutMs),
+		maxOutputBytes: positiveNumber(file.exec?.maxOutputBytes, DEFAULT_EXEC.maxOutputBytes),
+		maxOutputLines: positiveNumber(file.exec?.maxOutputLines, DEFAULT_EXEC.maxOutputLines),
+		passEnv: stringArray(file.exec?.passEnv) ?? DEFAULT_EXEC.passEnv,
+		env: typeof file.exec?.env === "object" && file.exec.env ? file.exec.env : {},
+	};
+
+	return {
+		workspace,
+		writeRoots,
+		denySegments,
+		denyPaths,
+		binDir,
+		execEnabled,
+		allowTools: stringArray(file.allowTools) ?? [],
+		exec,
+		configPath,
+		warnings,
+	};
+}

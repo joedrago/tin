@@ -1,0 +1,20 @@
+{
+	"name": "tin",
+	"version": "0.1.0",
+	"description": "A restricted-capability policy gate for pi: read anywhere, write only in the workspace, execute only what you have symlinked into ~/tinbin",
+	"type": "module",
+	"private": true,
+	"pi": {
+		"extensions": ["./src/index.ts"]
+	},
+	"scripts": {
+		"test": "node --test test/*.test.ts",
+		"typecheck": "tsc --noEmit"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^0.84.4",
+		"@types/node": "^22.19.19",
+		"typebox": "^1.3.7",
+		"typescript": "^5.9.3"
+	}
+}
