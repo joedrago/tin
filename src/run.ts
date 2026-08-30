@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { lstatSync, readdirSync, realpathSync, type Stats, statSync } from "node:fs";
 import path from "node:path";
 import type { TinPolicy } from "./config.ts";
@@ -181,14 +181,47 @@ function finish(sink: Capture, maxLines: number): { text: string; truncated: boo
 
 const KILL_GRACE_MS = 2_000;
 
+// How long to wait for the output pipes once the child itself has exited. Anything
+// that got out of the kill — a grandchild that called setsid, or on Windows one that
+// outlived taskkill — holds the write ends open, and "close" never fires. Past this
+// we drop the pipes and report what was captured.
+const PIPE_GRACE_MS = 1_000;
+
+/**
+ * Kill a whole process tree on Windows, where a signal only ever reaches one process.
+ * taskkill /T walks the children itself. /F is all it offers, which is also all
+ * child.kill() would do there.
+ */
+function killTreeWindows(child: ChildProcess): void {
+	const system32 = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32");
+	const args = ["/pid", String(child.pid), "/T", "/F"];
+	try {
+		const killer = spawn(path.join(system32, "taskkill.exe"), args, {
+			stdio: "ignore",
+			windowsHide: true,
+		});
+		killer.on("error", () => child.kill());
+	} catch {
+		// taskkill is missing or unspawnable; the single process is all we can reach.
+		child.kill();
+	}
+}
+
 /**
  * Run an allowed command with an argument array. No shell is involved, so the
  * arguments reach the process verbatim: no globbing, no expansion, no redirection,
  * no command substitution. stdin is closed so nothing can wait for input.
  *
- * The child gets its own process group and is killed as a group. Killing only the
- * child leaves its own children running, and they hold the output pipes open, so a
- * timeout would not actually end the call.
+ * On POSIX the child gets a session of its own, which is doing two jobs. It gives us a
+ * process group to kill: killing only the child leaves its own children running, and
+ * they hold the output pipes open, so a timeout would not actually end the call. It
+ * also drops the controlling terminal, so an allowed command cannot open /dev/tty to
+ * reach the terminal pi is running in, or push keystrokes into the shell that started
+ * it.
+ *
+ * Windows has neither. Detaching there buys nothing — process.kill(-pid) is not a group
+ * kill on Windows, it is a pid that cannot exist — and costs the console some commands
+ * expect, plus an orphan that outlives pi. The tree is killed with taskkill instead.
  */
 export function execCommand(
 	command: ResolvedCommand,
@@ -205,17 +238,24 @@ export function execCommand(
 			env: options.env,
 			stdio: ["ignore", "pipe", "pipe"],
 			shell: false,
-			detached: true,
+			detached: process.platform !== "win32",
+			windowsHide: true,
 		});
 
 		const out = capture();
 		const err = capture();
 		let timedOut = false;
 		let settled = false;
+		let exitCode: number | null = null;
+		let exitSignal: NodeJS.Signals | null = null;
 		const timers: NodeJS.Timeout[] = [];
 
 		const killGroup = (signal: NodeJS.Signals) => {
 			if (settled || child.pid === undefined) return;
+			if (process.platform === "win32") {
+				killTreeWindows(child);
+				return;
+			}
 			try {
 				process.kill(-child.pid, signal);
 			} catch {
@@ -227,7 +267,10 @@ export function execCommand(
 		const stop = (reason: "timeout" | "abort") => {
 			if (reason === "timeout") timedOut = true;
 			killGroup("SIGTERM");
-			timers.push(setTimeout(() => killGroup("SIGKILL"), KILL_GRACE_MS).unref());
+			// Nothing to escalate to on Windows: the first kill is already a forced one.
+			if (process.platform !== "win32") {
+				timers.push(setTimeout(() => killGroup("SIGKILL"), KILL_GRACE_MS).unref());
+			}
 		};
 
 		const onAbort = () => stop("abort");
@@ -256,19 +299,41 @@ export function execCommand(
 			reject(error);
 		});
 
-		child.on("close", (code, signal) => {
+		const settle = () => {
+			if (settled) return;
 			cleanup();
 			const stdout = finish(out, exec.maxOutputLines);
 			const stderr = finish(err, exec.maxOutputLines);
 			resolve({
 				stdout: stdout.text,
 				stderr: stderr.text,
-				exitCode: code,
-				signal,
+				exitCode,
+				signal: exitSignal,
 				timedOut,
 				truncated: stdout.truncated || stderr.truncated,
 				durationMs: Date.now() - startedAt,
 			});
+		};
+
+		child.on("close", (code, signal) => {
+			exitCode = code;
+			exitSignal = signal;
+			settle();
+		});
+
+		// "close" waits on the pipes as well as the process, so whatever is still holding
+		// them keeps this call open long after the command itself is over. Once the child
+		// is gone, give the pipes a moment to drain and then stop waiting on them.
+		child.on("exit", (code, signal) => {
+			exitCode = code;
+			exitSignal = signal;
+			timers.push(
+				setTimeout(() => {
+					child.stdout?.destroy();
+					child.stderr?.destroy();
+					settle();
+				}, PIPE_GRACE_MS).unref(),
+			);
 		});
 	});
 }

@@ -176,8 +176,11 @@ writable, whatever the write roots say.
 - `TERM=dumb`, and only the variables in `passEnv` are carried over. API keys, tokens,
   `SSH_AUTH_SOCK` and the rest of your environment are not passed to whatever runs.
 - stdin is closed, so nothing sits waiting for input.
-- The command runs in its own process group and is killed as a group on timeout or when you
-  press Esc — killing just the child would leave its children running and holding the pipes.
+- The command runs in a session of its own, and is killed as a process group on timeout or
+  when you press Esc — killing just the child would leave its children running and holding
+  the pipes. The session also means no controlling terminal, so an allowed command cannot
+  open `/dev/tty` to reach the terminal you are sitting at. Windows has neither, so the
+  tree is killed with `taskkill /T` there instead.
 
 Output is capped by bytes and lines, and the model is told when it was truncated.
 

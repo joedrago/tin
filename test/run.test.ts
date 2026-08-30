@@ -204,3 +204,25 @@ test("aborting the turn kills the command and its children", async () => {
 	assert.notEqual(outcome.signal, null);
 	assert.ok(Date.now() - started < 5_000);
 });
+
+test("a grandchild left holding the pipes does not hold up the call", async () => {
+	const fx = fixture();
+	const sleep = ["/bin/sleep", "/usr/bin/sleep"].find((candidate) => existsSync(candidate));
+	assert.ok(sleep, "no sleep binary to link");
+	link(fx, "sleep", sleep);
+	// The script exits immediately, but the sleep it leaves behind inherited stdout
+	// and holds the pipe open — and "close" waits on the pipes, not just the process.
+	script(fx, "daemonize", "#!/bin/sh\nsleep 10 &\necho started\n");
+	fx.policy.exec.timeoutMs = 10_000;
+
+	const outcome = await execCommand(resolveCommand("daemonize", fx.policy), [], {
+		cwd: fx.workspace,
+		env: buildChildEnv(fx.policy),
+		policy: fx.policy,
+	});
+
+	assert.equal(outcome.exitCode, 0);
+	assert.equal(outcome.timedOut, false);
+	assert.equal(outcome.stdout.trim(), "started");
+	assert.ok(outcome.durationMs < 5_000, `took ${outcome.durationMs}ms`);
+});
