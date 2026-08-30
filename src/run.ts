@@ -207,6 +207,93 @@ function killTreeWindows(child: ChildProcess): void {
 	}
 }
 
+/** Windows script types that are not images and so cannot be started on their own. */
+const WINDOWS_BATCH = /\.(?:bat|cmd)$/i;
+const WINDOWS_NODE_SCRIPT = /\.(?:mjs|cjs|js)$/i;
+
+function comSpec(): string {
+	return (
+		process.env.ComSpec ??
+		path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "cmd.exe")
+	);
+}
+
+/**
+ * Quote one value so it survives cmd.exe and reaches the program unchanged.
+ *
+ * Two different parsers see it. The C runtime of whatever finally starts splits on
+ * unquoted whitespace and reads \" as a literal quote, so the value is wrapped in
+ * quotes with its own quotes escaped and the backslashes in front of them doubled.
+ * Before that, cmd scans the line for its own metacharacters — which it acts on even
+ * inside quotes, because /c takes the tail verbatim rather than as a quoted string —
+ * and a caret in front of each one turns it back into a character.
+ *
+ * %NAME% is covered by the same carets, but for a different reason: there is no
+ * escape for a percent on a command line, and the caret is not one. It survives
+ * because cmd looks for the %NAME% shape before it removes carets, and ^%NAME^% is
+ * not that shape — so the expansion never happens and the carets come off after.
+ *
+ * `passes` is how many cmd parses the value goes through, each of which eats one
+ * layer of carets: one for the command line itself, and a second for a batch file,
+ * whose %* is substituted into a line that is then parsed again.
+ */
+export function quoteForCmd(value: string, passes: number): string {
+	let quoted = `"${value.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, "$1$1")}"`;
+	for (let pass = 0; pass < passes; pass++) {
+		quoted = quoted.replace(/[()%!^"<>&|]/g, "^$&");
+	}
+	return quoted;
+}
+
+export interface Launch {
+	file: string;
+	args: string[];
+	verbatim: boolean;
+}
+
+/**
+ * Work out what to actually hand to CreateProcess.
+ *
+ * Everywhere but Windows, and for a real executable on Windows, that is the allowlist
+ * entry itself. A .bat or .cmd is not an image: Windows cannot start one, and since
+ * Node 18.20 (CVE-2024-27980) spawning one without a shell does not quietly fall back
+ * to cmd either — it fails with EINVAL. So cmd is invoked explicitly, with the whole
+ * command line built here and windowsVerbatimArguments set, because Node's own
+ * quoting is written for the C runtime and would leave cmd's metacharacters live.
+ *
+ * This is still not a shell for the model: it is one fixed `cmd /d /s /c` around one
+ * resolved allowlist entry, with every argument escaped to arrive as a literal.
+ */
+export function buildLaunch(command: ResolvedCommand, args: string[]): Launch {
+	if (process.platform !== "win32") return { file: command.link, args, verbatim: false };
+
+	// A Node script is the other thing Windows cannot start, and for the same reason:
+	// there is no shebang line, so the extension is all there is to go on. It is worth
+	// handling because a wrapper with a policy in it wants a real language, and one
+	// written for node needs nothing found or installed — pi is already running on it,
+	// so process.execPath is the interpreter, known exactly rather than searched for.
+	// Arguments go straight into argv with no shell and no cmd in the way. Node reads
+	// none of its own options from this list either: everything after the script path
+	// is the script's. NODE_OPTIONS would still be read, but tin builds the child
+	// environment itself and does not carry it over.
+	if (WINDOWS_NODE_SCRIPT.test(command.link)) {
+		return { file: process.execPath, args: [command.link, ...args], verbatim: false };
+	}
+
+	if (WINDOWS_BATCH.test(command.link)) {
+		// The batch file's own path is parsed once; its arguments are parsed again on
+		// the line %* expands into.
+		const line = [quoteForCmd(command.link, 1), ...args.map((arg) => quoteForCmd(arg, 2))].join(
+			" ",
+		);
+		// /d skips AutoRun commands out of the registry, which would otherwise run first.
+		// /s makes cmd strip exactly the outer quotes and take the rest as written.
+		return { file: comSpec(), args: ["/d", "/s", "/c", `"${line}"`], verbatim: true };
+	}
+
+	return { file: command.link, args, verbatim: false };
+}
+
 /**
  * Run an allowed command with an argument array. No shell is involved, so the
  * arguments reach the process verbatim: no globbing, no expansion, no redirection,
@@ -232,14 +319,17 @@ export function execCommand(
 	const { exec } = options.policy;
 	const startedAt = Date.now();
 
+	const launch = buildLaunch(command, args);
+
 	return new Promise<ExecOutcome>((resolve, reject) => {
-		const child = spawn(command.link, args, {
+		const child = spawn(launch.file, launch.args, {
 			cwd: options.cwd,
 			env: options.env,
 			stdio: ["ignore", "pipe", "pipe"],
 			shell: false,
 			detached: process.platform !== "win32",
 			windowsHide: true,
+			windowsVerbatimArguments: launch.verbatim,
 		});
 
 		const out = capture();

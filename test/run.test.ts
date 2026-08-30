@@ -4,9 +4,11 @@ import path from "node:path";
 import { test } from "node:test";
 import {
 	buildChildEnv,
+	buildLaunch,
 	execCommand,
 	formatOutcome,
 	listCommands,
+	quoteForCmd,
 	resolveCommand,
 	resolveWorkingDirectory,
 	TinDenied,
@@ -14,6 +16,9 @@ import {
 import { dataFile, fixture, link, script } from "./helpers.ts";
 
 const ECHO = ["/bin/echo", "/usr/bin/echo"].find((candidate) => existsSync(candidate));
+
+/** Marks a test that only means anything on Windows. */
+const windowsOnly = { skip: process.platform === "win32" ? false : "Windows only" };
 
 test("only names linked into the command directory resolve", () => {
 	const fx = fixture();
@@ -109,6 +114,100 @@ test("arguments reach the process verbatim, with no shell interpretation", async
 
 	assert.equal(outcome.exitCode, 0);
 	assert.equal(outcome.stdout, "a b $HOME * | && $(id)\n");
+});
+
+test("quoteForCmd escapes one layer of cmd metacharacters per pass", () => {
+	assert.equal(quoteForCmd("plain", 0), '"plain"');
+	assert.equal(quoteForCmd("plain", 1), '^"plain^"');
+	assert.equal(quoteForCmd("plain", 2), '^^^"plain^^^"');
+	// A quote is escaped for the C runtime, and the backslashes before one doubled.
+	assert.equal(quoteForCmd('say "hi"', 0), '"say \\"hi\\""');
+	assert.equal(quoteForCmd("trail\\", 0), '"trail\\\\"');
+	assert.equal(quoteForCmd("a\\\\\\", 0), '"a\\\\\\\\\\\\"');
+	// %NAME% only survives because the carets break the shape cmd looks for.
+	assert.equal(quoteForCmd("%PATH%", 1), '^"^%PATH^%^"');
+});
+
+test("a .bat is launched through cmd, a .mjs through node, anything else directly", windowsOnly, () => {
+	const fx = fixture();
+	const direct = buildLaunch(
+		{ name: "tool.exe", link: path.join(fx.binDir, "tool.exe"), target: "x" },
+		["a b"],
+	);
+	assert.equal(direct.file, path.join(fx.binDir, "tool.exe"));
+	assert.deepEqual(direct.args, ["a b"]);
+	assert.equal(direct.verbatim, false);
+
+	// The interpreter is the node tin is itself running on, not one looked up on PATH.
+	const script = path.join(fx.binDir, "tool.mjs");
+	const viaNode = buildLaunch({ name: "tool.mjs", link: script, target: script }, ["a b", "&"]);
+	assert.equal(viaNode.file, process.execPath);
+	assert.deepEqual(viaNode.args, [script, "a b", "&"]);
+	assert.equal(viaNode.verbatim, false);
+
+	const entry = path.join(fx.binDir, "tool.bat");
+	const batch = buildLaunch({ name: "tool.bat", link: entry, target: entry }, ["a b"]);
+	assert.match(batch.file, /cmd\.exe$/i);
+	assert.equal(batch.verbatim, true);
+	assert.deepEqual(batch.args.slice(0, 3), ["/d", "/s", "/c"]);
+	// The path is parsed once; the argument is parsed again on the line %* expands into.
+	assert.equal(batch.args[3], `"${quoteForCmd(entry, 1)} ${quoteForCmd("a b", 2)}"`);
+});
+
+test("a .bat entry runs, and cmd's metacharacters reach it as literals", windowsOnly, async () => {
+	const fx = fixture();
+	// The batch forwards to node, which reports its argv exactly as it received it.
+	// Echoing from cmd itself could not tell a mangled argument from a mangled echo.
+	dataFile(fx, "argv.mjs", "console.log(JSON.stringify(process.argv.slice(2)));\n");
+	script(fx, "argv.bat", '@echo off\r\n"%TIN_TEST_NODE%" "%TIN_TEST_DUMP%" %*\r\n');
+
+	const args = [
+		"a b",
+		"&",
+		"|",
+		"<",
+		">",
+		"^",
+		"(",
+		")",
+		"!",
+		"*",
+		"%PATH%",
+		"%%",
+		'say "hi"',
+		"trail\\",
+		"--pretty=format:%h %s",
+		"",
+	];
+	const outcome = await execCommand(resolveCommand("argv.bat", fx.policy), args, {
+		cwd: fx.workspace,
+		env: {
+			...buildChildEnv(fx.policy),
+			SystemRoot: process.env.SystemRoot ?? "",
+			TIN_TEST_NODE: process.execPath,
+			TIN_TEST_DUMP: path.join(fx.binDir, "argv.mjs"),
+		},
+		policy: fx.policy,
+	});
+
+	assert.equal(outcome.exitCode, 0, outcome.stderr);
+	assert.deepEqual(JSON.parse(outcome.stdout.trim()), args);
+});
+
+test("a .mjs entry runs, and gets its arguments as argv", windowsOnly, async () => {
+	const fx = fixture();
+	script(fx, "argv.mjs", "console.log(JSON.stringify(process.argv.slice(2)));\n");
+
+	// Including the shapes node would otherwise read as its own options.
+	const args = ["--version", "-e", "console.log(1)", "a b", "&", '"', "\\", ""];
+	const outcome = await execCommand(resolveCommand("argv.mjs", fx.policy), args, {
+		cwd: fx.workspace,
+		env: buildChildEnv(fx.policy),
+		policy: fx.policy,
+	});
+
+	assert.equal(outcome.exitCode, 0, outcome.stderr);
+	assert.deepEqual(JSON.parse(outcome.stdout.trim()), args);
 });
 
 test("exit codes and stderr come back intact", async () => {

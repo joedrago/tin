@@ -103,6 +103,11 @@ absolute path, chosen from a short list of the usual locations at the top of the
 Edit that list if yours lives somewhere else. Read the one you link before you link it —
 you are the one who ends up trusting it.
 
+Windows has no `/bin/sh`, so a wrapper that is worth having there is written for Node
+instead and named `.mjs` — see [Windows](#windows) below. `git` and `git.mjs` are the
+same policy in two languages, which means a rule added to one is missing from the other
+until it is added there too. `test/wrapper-git.test.ts` covers the Node one.
+
 ### `git` — read-only git
 
 An allowlist of subcommands that only inspect a repository: `log`, `diff`, `show`,
@@ -129,6 +134,42 @@ into an exec:
   `diff.external`, `core.fsmonitor`, `gpg.program`, hooks path — so a repository that
   sets one does not get to use it. `--no-optional-locks` keeps a plain `status` from
   rewriting the index, so the read stays a read.
+
+## Windows
+
+The allowlist directory is `%USERPROFILE%\tinbin`, and everything above still holds, but
+what you can put in it is narrower:
+
+- **Link the file, extension and all.** `mklink /H %USERPROFILE%\tinbin\rg.exe C:\path\to\rg.exe`
+  needs no admin rights; a symlink does, unless Developer Mode is on. The name in the
+  directory is the name the model calls, so this one is `rg.exe`, not `rg`.
+- **An entry with no extension will not run.** Windows starts an image, not a shebang
+  line, so a POSIX script named `git` is not something it can launch. Wrappers meant for
+  Windows carry an extension, and the model calls them by it.
+- **`.mjs`, `.cjs` and `.js` entries run under Node**, started with the same node pi is
+  running on, so there is nothing to find or install. Arguments go straight into `argv`
+  with no shell and no cmd in between, and node reads none of its own options out of
+  them. This is the good way to write a wrapper with a policy in it: `wrappers/git.mjs`
+  is the read-only git policy in a language that can express it.
+- **`.bat` and `.cmd` entries are launched through `cmd /d /s /c`**, because they are not
+  images either and Node refuses to spawn one without a shell. Arguments are escaped for
+  both of cmd's parses on the way in, so `& | < > ^ %` quotes and backslashes reach the
+  program verbatim — the model still gets an argument array, not a shell. `/d` skips
+  whatever `AutoRun` is set in the registry. Prefer `.mjs` unless you specifically need
+  cmd.
+- **There is no executable bit.** Every file reads as executable on Windows, so being in
+  the directory at all is the whole allowlist decision. Keep data files out of it.
+
+So the read-only git looks like this, and the model calls it as `git.mjs`:
+
+```bat
+mklink /H %USERPROFILE%\tinbin\git.mjs C:\work\tin\wrappers\git.mjs
+```
+
+A hard link shares its contents with the file it was made from, so linking a wrapper
+straight out of this repo means editing the repo edits the allowlisted command. That is
+usually what you want. It is safe here only because tin refuses writes to its own source
+tree; do not hard-link a wrapper you keep inside a write root.
 
 ## Configuration
 
@@ -174,7 +215,12 @@ writable, whatever the write roots say.
 - `PATH` is `~/tinbin` and nothing else, so a command that shells out internally also finds
   only allowed commands.
 - `TERM=dumb`, and only the variables in `passEnv` are carried over. API keys, tokens,
-  `SSH_AUTH_SOCK` and the rest of your environment are not passed to whatever runs.
+  `SSH_AUTH_SOCK` and the rest of your environment are not passed to whatever runs. On
+  Windows the default list also carries `SystemRoot`, `windir`, `SystemDrive`, `ComSpec`,
+  `PATHEXT`, `USERPROFILE`, `USERNAME`, `APPDATA`, `LOCALAPPDATA`, `TEMP`, `TMP`,
+  `NUMBER_OF_PROCESSORS` and `PROCESSOR_ARCHITECTURE`, without which most programs there
+  fail in ways that are hard to read. Setting `passEnv` yourself replaces the whole list,
+  Windows names included.
 - stdin is closed, so nothing sits waiting for input.
 - The command runs in a session of its own, and is killed as a process group on timeout or
   when you press Esc — killing just the child would leave its children running and holding

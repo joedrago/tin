@@ -58,7 +58,34 @@ export interface TinPolicy {
 
 export const DEFAULT_DENY_SEGMENTS = [".git", ".pi", ".agents"];
 
-const DEFAULT_PASS_ENV = ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TMPDIR"];
+const POSIX_PASS_ENV = ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TMPDIR"];
+
+/**
+ * The same short list for Windows, where these are not conveniences: a process
+ * started without SystemRoot fails somewhere inside the C runtime or the socket
+ * stack rather than reporting anything useful, and cmd.exe, PATHEXT, TEMP and the
+ * per-user directories are how ordinary programs find themselves at all. Nothing
+ * here is a secret; USERPROFILE, APPDATA and LOCALAPPDATA give a program the user's
+ * own configuration, which is exactly what HOME already gives it on POSIX.
+ */
+const WINDOWS_PASS_ENV = [
+	"SystemRoot",
+	"windir",
+	"SystemDrive",
+	"ComSpec",
+	"PATHEXT",
+	"USERPROFILE",
+	"USERNAME",
+	"APPDATA",
+	"LOCALAPPDATA",
+	"TEMP",
+	"TMP",
+	"NUMBER_OF_PROCESSORS",
+	"PROCESSOR_ARCHITECTURE",
+];
+
+const DEFAULT_PASS_ENV =
+	process.platform === "win32" ? [...POSIX_PASS_ENV, ...WINDOWS_PASS_ENV] : POSIX_PASS_ENV;
 
 const DEFAULT_EXEC: TinExecPolicy = {
 	timeoutMs: 120_000,
