@@ -4,6 +4,9 @@
 	"description": "A restricted-capability policy gate for pi: read anywhere, write only in the workspace, execute only what you have symlinked into ~/tinbin",
 	"type": "module",
 	"private": true,
+	"bin": {
+		"tin": "./bin/tin"
+	},
 	"pi": {
 		"extensions": ["./src/index.ts"]
 	},
