@@ -52,7 +52,7 @@ export function script(fx: Fixture, name: string, body: string): void {
 	writeFileSync(path.join(fx.binDir, name), body, { mode: 0o755 });
 }
 
-/** Write a non-executable file into the fixture's allowlist directory. */
+/** Write a file with no executable bit into the fixture's allowlist directory. */
 export function dataFile(fx: Fixture, name: string, body: string): void {
 	writeFileSync(path.join(fx.binDir, name), body, { mode: 0o644 });
 }

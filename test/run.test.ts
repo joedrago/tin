@@ -44,7 +44,12 @@ test("broken links and non-executables are refused", () => {
 	dataFile(fx, "notes", "just data\n");
 
 	assert.throws(() => resolveCommand("ghost", fx.policy), TinDenied);
-	assert.throws(() => resolveCommand("notes", fx.policy), TinDenied);
+	// Windows has no executable bit, so being linked in is the whole decision there.
+	if (process.platform === "win32") {
+		assert.equal(resolveCommand("notes", fx.policy).name, "notes");
+	} else {
+		assert.throws(() => resolveCommand("notes", fx.policy), TinDenied);
+	}
 });
 
 test("listCommands reports what is usable and nothing else", () => {

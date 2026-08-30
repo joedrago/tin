@@ -1,11 +1,23 @@
 import { spawn } from "node:child_process";
-import { lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { lstatSync, readdirSync, realpathSync, type Stats, statSync } from "node:fs";
 import path from "node:path";
 import type { TinPolicy } from "./config.ts";
 import { canonicalize, isInside } from "./paths.ts";
 
 /** Command names must be a bare filename in binDir — no paths, no traversal. */
 const COMMAND_NAME = /^[A-Za-z0-9][A-Za-z0-9._+-]*$/;
+
+/**
+ * Whether a resolved target counts as runnable.
+ *
+ * Windows has no executable bit: Node derives st_mode from the read-only
+ * attribute, so every file there reads as mode 0o666 or 0o444 and the 0o111 test
+ * rejects everything. On Windows, having been linked into binDir at all is the
+ * allowlist decision; everywhere else the bit still has to be set.
+ */
+function isRunnable(stats: Stats): boolean {
+	return process.platform === "win32" || (stats.mode & 0o111) !== 0;
+}
 
 export interface ResolvedCommand {
 	name: string;
@@ -55,14 +67,14 @@ export function resolveCommand(name: string, policy: TinPolicy): ResolvedCommand
 	if (!stats.isFile()) {
 		throw new TinDenied(`tin: "${name}" does not resolve to a file.`);
 	}
-	if ((stats.mode & 0o111) === 0) {
+	if (!isRunnable(stats)) {
 		throw new TinDenied(`tin: "${name}" resolves to ${target}, which is not executable.`);
 	}
 
 	return { name, link, target };
 }
 
-/** Names currently linked in binDir, sorted. Broken and non-executable entries are skipped. */
+/** Names currently linked in binDir, sorted. Broken and non-runnable entries are skipped. */
 export function listCommands(policy: TinPolicy): string[] {
 	if (!policy.execEnabled) return [];
 	let entries: string[];
@@ -76,7 +88,7 @@ export function listCommands(policy: TinPolicy): string[] {
 		if (!COMMAND_NAME.test(entry)) continue;
 		try {
 			const stats = statSync(path.join(policy.binDir, entry));
-			if (stats.isFile() && (stats.mode & 0o111) !== 0) usable.push(entry);
+			if (stats.isFile() && isRunnable(stats)) usable.push(entry);
 		} catch {
 			// Broken link or unreadable target; not offered.
 		}
