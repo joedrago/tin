@@ -100,3 +100,19 @@ export function describePolicy(policy: TinPolicy): string {
 	const roots = policy.writeRoots.map((root) => path.basename(root)).join(", ") || "none";
 	return `tin: write ${roots} · exec ${policy.execEnabled ? policy.binDir : "off"}`;
 }
+
+/**
+ * The write roots as a session-start banner, marking the ones granted for this
+ * session alone. Write roots are the whole of what tin is protecting, so they are
+ * worth stating outright at the top of a session rather than leaving in the status
+ * line: an extra root is a thing you asked for once and then have to remember.
+ */
+export function describeWriteRoots(policy: TinPolicy): string {
+	if (policy.writeRoots.length === 0) {
+		return "tin: nothing is writable in this session";
+	}
+	const lines = policy.writeRoots.map((root) =>
+		policy.extraWriteRoots.includes(root) ? `  ${root}  (this session only)` : `  ${root}`,
+	);
+	return [`tin: writable ${lines.length === 1 ? "directory" : "directories"}`, ...lines].join("\n");
+}

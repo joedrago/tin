@@ -33,6 +33,39 @@ To try it on one session first:
 pi -e ~/work/tin/src/index.ts
 ```
 
+## Extra write roots for one session
+
+The workspace is the only writable directory, which is the point, right up until the job
+genuinely spans two of them. `bin/tin` starts pi with the directories you name added to
+the write roots for that session and no longer:
+
+```sh
+ln -s ~/work/tin/bin/tin ~/bin/tin
+
+tin                     # exactly a plain pi: the working directory and nothing else
+tin ../shared ~/notes   # those two as well, until you close the session
+tin -r ../shared        # the same, picking a session to resume
+```
+
+Order does not matter, `-r` is handed to pi, and anything else beginning with `-` is
+refused rather than quietly forwarded. A directory that does not exist is an error from
+the shell you are still looking at, not a warning inside a session you have already
+started.
+
+tin prints the roots it ended up with as the session opens, with the temporary ones
+marked, because a root you granted on a command line an hour ago is exactly the kind of
+thing worth being reminded of:
+
+```
+tin: writable directories
+  /home/you/work/thing
+  /home/you/notes  (this session only)
+```
+
+`/tin` shows them too, and says which of them came from the environment. The wrapper
+resolves nothing relative to itself, so a symlink onto your `PATH` is the whole
+installation.
+
 ## Allowing commands
 
 Create the directory and link in exactly what you are willing to let the model run:
@@ -203,6 +236,14 @@ falls back to those defaults rather than to something more permissive.
 - **`allowTools`** — extra tool names to let through the gate, for tools from other
   extensions you trust.
 
+One setting also has an environment variable, `TIN_EXTRA_WRITE_ROOTS`: a delimiter-separated
+list of directories, in the shape of `PATH`, *added* to whatever `writeRoots` resolved to
+rather than replacing it. This is what [`bin/tin`](#extra-write-roots-for-one-session) sets,
+and setting it yourself does the same thing. It is read once, at session start, from pi's own
+environment — somewhere the model cannot reach, since `tin_run` builds its children an
+environment from scratch and never passes this one on. The roots it names are checked exactly
+as configured roots are, so naming one that contains `binDir` disables execution just the same.
+
 The config is read from your home directory and never from the project, because the model
 can write in the project — a project-local policy file would be a policy the model edits.
 For the same reason, tin's own source directory, its config file, and `binDir` are never
@@ -263,4 +304,5 @@ npm run typecheck # against pi's published types
 The interesting logic is deliberately free of pi imports so it can be tested directly:
 `src/paths.ts` (canonicalization and containment), `src/policy.ts` (the gate),
 `src/config.ts` (policy resolution), `src/run.ts` (allowlist and execution).
-`src/index.ts` is only the wiring.
+`src/index.ts` is only the wiring, and `bin/tin` is a standalone launcher that knows
+nothing about tin beyond the name of one environment variable.

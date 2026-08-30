@@ -40,6 +40,8 @@ export interface TinPolicy {
 	workspace: string;
 	/** Canonical directories the model may write into. */
 	writeRoots: string[];
+	/** The subset of writeRoots handed to this session alone, not from the config file. */
+	extraWriteRoots: string[];
 	/** Segments blocked at any depth inside a write root. */
 	denySegments: string[];
 	/** Absolute paths (and their subtrees) blocked regardless of write roots. */
@@ -104,6 +106,12 @@ export interface BuildPolicyOptions {
 	agentDir: string;
 	/** Directory holding tin's own source, which is never writable. */
 	selfDir?: string;
+	/**
+	 * Write roots for this session only, added to the configured ones rather than
+	 * replacing them. `bin/tin` puts the directories from its command line here, by
+	 * way of the environment; see TIN_EXTRA_WRITE_ROOTS in src/index.ts.
+	 */
+	extraWriteRoots?: string[];
 	/** Override the config file location (tests). */
 	configPath?: string;
 	/** Injected for tests. */
@@ -182,14 +190,30 @@ export function buildPolicy(options: BuildPolicyOptions): TinPolicy {
 	}
 	const rootCandidates = configuredRoots ?? [workspace];
 	const writeRoots: string[] = [];
-	for (const candidate of rootCandidates) {
+	const addRoot = (candidate: string, label: string): string | undefined => {
 		const resolved = canonicalize(expandTilde(candidate, home), cwd);
 		if (!isDirectory(resolved)) {
-			warnings.push(`writeRoot ${candidate} is not an existing directory — dropped`);
-			continue;
+			warnings.push(`${label} ${candidate} is not an existing directory — dropped`);
+			return undefined;
 		}
 		if (!writeRoots.includes(resolved)) writeRoots.push(resolved);
+		return resolved;
+	};
+	for (const candidate of rootCandidates) addRoot(candidate, "writeRoot");
+
+	// Roots granted for this session only, on top of whatever the config resolved to.
+	// They are tracked separately as well so the session can say out loud which of its
+	// write roots are the temporary ones — a root you granted on a command line an hour
+	// ago is exactly the kind of thing worth being reminded of.
+	const configured = new Set(writeRoots);
+	const extraWriteRoots: string[] = [];
+	for (const candidate of options.extraWriteRoots ?? []) {
+		const resolved = addRoot(candidate, "extra write root");
+		if (resolved !== undefined && !configured.has(resolved) && !extraWriteRoots.includes(resolved)) {
+			extraWriteRoots.push(resolved);
+		}
 	}
+
 	if (writeRoots.length === 0) {
 		warnings.push("no usable write roots — all writes will be denied");
 	}
@@ -228,6 +252,7 @@ export function buildPolicy(options: BuildPolicyOptions): TinPolicy {
 	return {
 		workspace,
 		writeRoots,
+		extraWriteRoots,
 		denySegments,
 		denyPaths,
 		binDir,

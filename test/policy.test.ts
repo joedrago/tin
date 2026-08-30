@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { test } from "node:test";
 import { canonicalize, expandTilde, isInside } from "../src/paths.ts";
-import { checkWritePath, decideToolCall } from "../src/policy.ts";
+import { buildPolicy } from "../src/config.ts";
+import { checkWritePath, decideToolCall, describeWriteRoots } from "../src/policy.ts";
 import { fixture } from "./helpers.ts";
 
 function allowed(name: string, input: Record<string, unknown>, fx = fixture()) {
@@ -106,4 +107,23 @@ test("an empty path is denied rather than resolving to cwd", () => {
 	const fx = fixture();
 	assert.equal(allowed("write", {}, fx).allow, false);
 	assert.equal(allowed("write", { path: "   " }, fx).allow, false);
+});
+
+test("the session banner marks the roots that are only there for this session", () => {
+	const fx = fixture();
+	const policy = buildPolicy({
+		cwd: fx.workspace,
+		home: fx.home,
+		agentDir: fx.agentDir,
+		configPath: fx.policy.configPath,
+		extraWriteRoots: [fx.outside],
+	});
+	const banner = describeWriteRoots(policy);
+	assert.match(banner, new RegExp(`${fx.workspace}\\s*$`, "m"));
+	assert.match(banner, new RegExp(`${fx.outside}\\s+\\(this session only\\)`));
+});
+
+test("the session banner says nothing is writable rather than listing an empty set", () => {
+	const fx = fixture({ writeRoots: [] });
+	assert.match(describeWriteRoots(fx.policy), /nothing is writable/);
 });

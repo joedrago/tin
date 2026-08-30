@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { buildPolicy, type TinPolicy } from "../src/config.ts";
@@ -22,7 +22,10 @@ export interface Fixture {
  *   <root>/outside/            everything the model must not reach
  */
 export function fixture(config?: Record<string, unknown>): Fixture {
-	const root = mkdtempSync(path.join(os.tmpdir(), "tin-test-"));
+	// Canonicalized up front: buildPolicy resolves symlinks, and on macOS the temp
+	// directory is reached through one (/var -> /private/var), so a fixture that kept
+	// the path it was handed would never match the policy it built.
+	const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "tin-test-")));
 	const home = path.join(root, "home");
 	const agentDir = path.join(home, ".pi", "agent");
 	const workspace = path.join(home, "work");

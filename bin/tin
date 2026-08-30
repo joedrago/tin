@@ -1,0 +1,104 @@
+#!/usr/bin/env node
+// tin — start pi with a temporary set of extra write roots.
+//
+//     tin [-r] [DIR [DIR...]]
+//
+// Order does not matter. Plain `tin` is plain `pi`: the working directory is the
+// only place the model may write, exactly as the extension behaves on its own.
+// Every DIR named on the command line is added to that set for this one session,
+// handed over in TIN_EXTRA_WRITE_ROOTS, and tin prints the roots it ended up with
+// when the session opens. `-r` (resume a session) is passed through to pi.
+//
+// Symlink this anywhere on your PATH; it locates nothing relative to itself, so a
+// link out of the repo works with no further setup.
+
+import { spawn } from "node:child_process";
+import { statSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+/** Matches expandTilde in src/paths.ts, for the argument your shell did not expand. */
+function expandTilde(input) {
+	if (input === "~") return os.homedir();
+	if (input.startsWith("~/")) return path.join(os.homedir(), input.slice(2));
+	return input;
+}
+
+/** Must match EXTRA_ROOTS_ENV in src/index.ts. */
+const EXTRA_ROOTS_ENV = "TIN_EXTRA_WRITE_ROOTS";
+
+const USAGE = `usage: tin [-r] [DIR [DIR...]]
+
+  DIR  a directory the model may also write in, for this session only
+  -r   passed through to pi: pick a session to resume
+`;
+
+function fail(message) {
+	process.stderr.write(`tin: ${message}\n`);
+	process.exit(2);
+}
+
+const dirs = [];
+const piArgs = [];
+
+for (const arg of process.argv.slice(2)) {
+	if (arg === "-h" || arg === "--help") {
+		process.stdout.write(USAGE);
+		process.exit(0);
+	} else if (arg === "-r") {
+		if (!piArgs.includes("-r")) piArgs.push("-r");
+	} else if (arg.startsWith("-")) {
+		fail(`unknown option ${arg}\n\n${USAGE}`);
+	} else {
+		dirs.push(arg);
+	}
+}
+
+// Resolved here rather than left to the extension so a typo is a message from the
+// shell you are still looking at, not a warning inside a session you have already
+// started. The extension canonicalizes these again — symlinks and all — before it
+// trusts them, so this is convenience, not the check that matters.
+const roots = [];
+for (const dir of dirs) {
+	const resolved = path.resolve(expandTilde(dir));
+	let stats;
+	try {
+		stats = statSync(resolved);
+	} catch {
+		fail(`${dir}: no such directory`);
+	}
+	if (!stats.isDirectory()) fail(`${dir}: not a directory`);
+	if (resolved.includes(path.delimiter)) {
+		fail(`${resolved} contains ${path.delimiter}, which separates entries in ${EXTRA_ROOTS_ENV}`);
+	}
+	if (!roots.includes(resolved)) roots.push(resolved);
+}
+
+// An inherited value is dropped rather than merged: `tin` with no directories has
+// to mean the working directory and nothing else, whatever is exported around it.
+const env = { ...process.env };
+if (roots.length > 0) env[EXTRA_ROOTS_ENV] = roots.join(path.delimiter);
+else delete env[EXTRA_ROOTS_ENV];
+
+const child = spawn("pi", piArgs, {
+	stdio: "inherit",
+	env,
+	// On Windows pi is a .cmd shim, which Node will not start as an image. Nothing
+	// from the command line reaches this argument list except the literal `-r`, so
+	// there is nothing here for cmd to reinterpret.
+	shell: process.platform === "win32",
+});
+
+// Ctrl-C is delivered to pi directly through the shared terminal. Without these the
+// wrapper would take the default action and hand the shell back its prompt while pi
+// was still drawing on the screen.
+process.on("SIGINT", () => {});
+process.on("SIGTERM", () => {});
+
+child.on("error", (error) => {
+	fail(error.code === "ENOENT" ? "could not find pi on PATH" : error.message);
+});
+
+child.on("exit", (code, signal) => {
+	process.exit(signal ? 128 + (os.constants.signals[signal] ?? 0) : (code ?? 0));
+});

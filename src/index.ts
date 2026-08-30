@@ -4,7 +4,13 @@ import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil
 import os from "node:os";
 import { Type } from "typebox";
 import { buildPolicy, type TinPolicy } from "./config.ts";
-import { allowedToolNames, decideToolCall, describePolicy, TIN_RUN } from "./policy.ts";
+import {
+	allowedToolNames,
+	decideToolCall,
+	describePolicy,
+	describeWriteRoots,
+	TIN_RUN,
+} from "./policy.ts";
 import {
 	buildChildEnv,
 	execCommand,
@@ -16,6 +22,23 @@ import {
 } from "./run.ts";
 
 const selfDir = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Write roots granted to one session, listed the way PATH is: a delimiter-separated
+ * list of directories, added to the configured roots rather than replacing them.
+ * `bin/tin` sets it from its command line.
+ *
+ * It is read from pi's own environment, which is not somewhere the model can reach:
+ * tin_run builds its child environment from scratch, so nothing the model runs can
+ * set this for a later session, and the variable is consulted once at session start.
+ */
+export const EXTRA_ROOTS_ENV = "TIN_EXTRA_WRITE_ROOTS";
+
+function extraWriteRootsFromEnv(): string[] {
+	const raw = process.env[EXTRA_ROOTS_ENV];
+	if (!raw) return [];
+	return raw.split(path.delimiter).filter((entry) => entry.trim() !== "");
+}
 
 /** tin's own source is never writable; cover both `src/index.ts` and a flat drop-in. */
 function selfPaths(): string {
@@ -59,6 +82,7 @@ export default function tin(pi: ExtensionAPI) {
 				home: os.homedir(),
 				agentDir: getAgentDir(),
 				selfDir: selfPaths(),
+				extraWriteRoots: extraWriteRootsFromEnv(),
 			});
 		}
 		return policy;
@@ -124,6 +148,7 @@ export default function tin(pi: ExtensionAPI) {
 		pi.setActiveTools(pi.getAllTools().map((tool) => tool.name).filter((name) => allowed.has(name)));
 
 		ctx.ui.setStatus("tin", describePolicy(active));
+		ctx.ui.notify(describeWriteRoots(active), "info");
 		for (const warning of active.warnings) ctx.ui.notify(warning, "warning");
 	});
 
@@ -161,6 +186,9 @@ export default function tin(pi: ExtensionAPI) {
 				`config      ${active.configPath}`,
 				`workspace   ${active.workspace}`,
 				`write roots ${active.writeRoots.join(", ") || "(none)"}`,
+				...(active.extraWriteRoots.length > 0
+					? [`  of which ${active.extraWriteRoots.join(", ")} came from ${EXTRA_ROOTS_ENV}`]
+					: []),
 				`protected   ${active.denySegments.join(", ")} + ${active.denyPaths.join(", ")}`,
 				`commands    ${active.execEnabled ? active.binDir : "(execution disabled)"}`,
 				`            ${commands.join(", ") || "(none linked)"}`,

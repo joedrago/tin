@@ -17,15 +17,15 @@ test("defaults are the strict ones", () => {
 test("the command directory defaults to ~/tinbin", () => {
 	const policy = buildPolicy({
 		cwd: "/tmp",
-		home: "/home/someone",
-		agentDir: "/home/someone/.pi/agent",
-		configPath: "/home/someone/.pi/agent/does-not-exist.json",
+		home: "/no-such-root/someone",
+		agentDir: "/no-such-root/someone/.pi/agent",
+		configPath: "/no-such-root/someone/.pi/agent/does-not-exist.json",
 		isDirectory: () => true,
 		readFile: () => {
 			throw new Error("no config");
 		},
 	});
-	assert.equal(policy.binDir, path.join("/home/someone", "tinbin"));
+	assert.equal(policy.binDir, path.join("/no-such-root/someone", "tinbin"));
 });
 
 test("a malformed config falls back to defaults instead of widening them", () => {
@@ -47,6 +47,61 @@ test("writeRoots entries that are not directories are dropped with a warning", (
 	assert.deepEqual(fx.policy.writeRoots, [fx.workspace]);
 	assert.equal(fx.policy.warnings.length, 1);
 	assert.match(fx.policy.warnings[0] ?? "", /nowhere/);
+});
+
+test("extra write roots are added to the configured ones, not swapped in", () => {
+	const fx = fixture();
+	const policy = buildPolicy({
+		cwd: fx.workspace,
+		home: fx.home,
+		agentDir: fx.agentDir,
+		configPath: fx.policy.configPath,
+		extraWriteRoots: [fx.outside],
+	});
+	assert.deepEqual(policy.writeRoots, [fx.workspace, fx.outside]);
+	assert.deepEqual(policy.extraWriteRoots, [fx.outside]);
+	assert.deepEqual(policy.warnings, []);
+});
+
+test("an extra write root that is already configured is not reported as extra", () => {
+	const fx = fixture();
+	const policy = buildPolicy({
+		cwd: fx.workspace,
+		home: fx.home,
+		agentDir: fx.agentDir,
+		configPath: fx.policy.configPath,
+		extraWriteRoots: [fx.workspace, fx.workspace],
+	});
+	assert.deepEqual(policy.writeRoots, [fx.workspace]);
+	assert.deepEqual(policy.extraWriteRoots, []);
+});
+
+test("extra write roots that are not directories are dropped with a warning", () => {
+	const fx = fixture();
+	const policy = buildPolicy({
+		cwd: fx.workspace,
+		home: fx.home,
+		agentDir: fx.agentDir,
+		configPath: fx.policy.configPath,
+		extraWriteRoots: [path.join(fx.root, "nowhere")],
+	});
+	assert.deepEqual(policy.writeRoots, [fx.workspace]);
+	assert.deepEqual(policy.extraWriteRoots, []);
+	assert.equal(policy.warnings.length, 1);
+	assert.match(policy.warnings[0] ?? "", /extra write root .*nowhere/);
+});
+
+test("an extra write root containing binDir disables execution just as a configured one does", () => {
+	const fx = fixture();
+	const policy = buildPolicy({
+		cwd: fx.workspace,
+		home: fx.home,
+		agentDir: fx.agentDir,
+		configPath: fx.policy.configPath,
+		extraWriteRoots: [fx.home],
+	});
+	assert.equal(policy.execEnabled, false);
+	assert.ok(policy.warnings.some((warning) => /execution disabled/.test(warning)));
 });
 
 test("a writable command directory disables execution loudly", () => {
