@@ -1,0 +1,97 @@
+#!/bin/sh
+#
+# tin wrapper: ripgrep with its two ways out closed.
+#
+# Link this into your allowlist directory instead of rg itself:
+#
+#     ln -s ~/work/tin/wrappers/rg ~/tinbin/rg
+#
+# Do not also link the real rg binary — this wrapper is only worth something if it
+# is the only rg the model can reach.
+#
+# rg looks like a pure reader and very nearly is: it has no flag that writes a
+# file, and everything it produces goes to stdout. What it does have is two flags
+# that hand it a program to run, and those are the whole reason this file exists:
+#
+#   --pre COMMAND          runs COMMAND on every file before searching it
+#   --pre-glob GLOB        chooses which files --pre applies to
+#   --hostname-bin COMMAND runs COMMAND to find the hostname, for hyperlinks
+#
+# Either of the two COMMAND flags is general code execution, which is exactly what
+# the allowlist exists to prevent, so all three are refused below.
+#
+# A third route is not a flag at all: rg reads a config file named by
+# RIPGREP_CONFIG_PATH and takes flags — including --pre — out of it. tin builds its
+# children an environment from scratch and does not carry that variable over, so it
+# is already closed, but relying on that would make this wrapper correct only by
+# something another file does. --no-config is passed on every call instead.
+#
+# -z/--search-zip is left alone deliberately. It runs a decompressor, but only one
+# it can find on PATH, and PATH inside tin is the allowlist directory — so it can
+# reach a decompressor exactly when you have allowlisted one, which is your
+# decision to have already made.
+
+set -eu
+
+# --- the real rg ----------------------------------------------------------------
+#
+# PATH inside tin is the allowlist directory and nothing else, so "rg" here would
+# find this script again. The real binary has to be named outright.
+
+RG=""
+for candidate in "${TIN_RG-}" /usr/bin/rg /usr/local/bin/rg /opt/homebrew/bin/rg /bin/rg /snap/bin/rg; do
+	if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+		RG=$candidate
+		break
+	fi
+done
+
+die() {
+	printf 'rg (tin wrapper): %s\n' "$*" >&2
+	exit 1
+}
+
+[ -n "$RG" ] || die "no rg binary found. Set TIN_RG, or edit the candidate list in this script."
+
+# --- policy ---------------------------------------------------------------------
+
+# Long options that hand rg a program to run. "pre" covers --pre-glob as well,
+# since the check below matches on prefixes.
+DANGEROUS_LONG="pre hostname-bin"
+
+# Compared in both directions, the way the git wrapper does it. Today's rg parses
+# long flags exactly and rejects an abbreviation outright, so only the first
+# direction can fire — the second is there so that a parser that starts accepting
+# prefixes does not quietly open --pre back up.
+check_long() {
+	name=$1
+	for bad in $DANGEROUS_LONG; do
+		case "$name" in "$bad"*) die "--$name is not allowed: --pre and --hostname-bin hand rg a program of its own to run, and --pre-glob is part of the first one. Running a program is what the allowlist exists to decide." ;; esac
+		case "$bad" in "$name"*) die "--$name may expand to --$bad, which hands rg a program of its own to run." ;; esac
+	done
+}
+
+# Everything after -- is a pattern or a path, never a flag, so it is not examined.
+# Before that, an argument that merely looks like one of these is refused rather
+# than reasoned about: if it is really a pattern, put it after --.
+after_ddash=0
+for arg in "$@"; do
+	[ "$after_ddash" = 1 ] && continue
+	case "$arg" in
+	--)
+		after_ddash=1
+		;;
+	--*)
+		name=${arg#--}
+		check_long "${name%%=*}"
+		;;
+	*) ;;
+	esac
+done
+
+# --- run it ---------------------------------------------------------------------
+
+# The config file is the other place --pre can come from.
+unset RIPGREP_CONFIG_PATH 2>/dev/null || true
+
+exec "$RG" --no-config "$@"

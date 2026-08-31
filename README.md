@@ -17,6 +17,10 @@ list. In their place is `tin_run`, which takes a command name and an array of ar
 execs it with no shell in between. Nothing is expanded — no pipes, no `>`, no globs, no
 `$(...)` — so redirection cannot be used to write where the write gate would have said no.
 
+Output still has to reach the next command somehow, and [capture](#capturing-output) is how:
+tin writes the command's stdout to a file of its own choosing and hands back the path. The
+model never names the destination, so this stays true — there is no `>` to point anywhere.
+
 ## Install
 
 tin belongs to you, not to a project, so install it globally:
@@ -72,9 +76,9 @@ Create the directory and link in exactly what you are willing to let the model r
 
 ```sh
 mkdir -p ~/tinbin
-ln -s "$(command -v rg)"  ~/tinbin/rg
-ln -s "$(command -v git)" ~/tinbin/git
-ln -s "$(command -v jq)"  ~/tinbin/jq
+ln -s ~/work/tin/wrappers/rg  ~/tinbin/rg    # not the real rg; see below
+ln -s ~/work/tin/wrappers/git ~/tinbin/git   # nor the real git
+ln -s "$(command -v jq)"      ~/tinbin/jq
 ```
 
 The model can then call them:
@@ -93,9 +97,20 @@ Adding and removing links takes effect immediately — no restart, no reload.
 **Choose these carefully.** The allowlist is the whole security model for execution. Linking
 `bash`, `sh`, `python`, `node`, `perl`, `make`, `npm`, `docker` or `env` hands back general
 code execution, and with it the ability to write anywhere you can write. `find` will run
-arbitrary programs through `-exec`. `git` can run hooks and pagers. Prefer narrow tools, or
-write a small wrapper script in `~/tinbin` that pins the subcommands you actually want —
-[`wrappers/`](wrappers) has a read-only `git` you can link instead of the real one.
+arbitrary programs through `-exec`. `git` can run hooks and pagers.
+
+The ones that catch people out are the tools that look inert and are not. `sed` writes an
+arbitrary path with its `w` command and edits in place with `-i`; `awk` has `system()` and
+`print > "file"`; `sort` has `-o`; `fd` has `-x`; even `rg`, which has no way to write a
+file at all, will run a program of your choosing through `--pre`. Read the manual page
+adversarially before you link something, and prefer a narrow tool, or a small wrapper in
+`~/tinbin` that pins what you actually want — [`wrappers/`](wrappers) has a read-only `git`
+and a `rg` with its two exec flags closed, either of which you can link instead of the real
+thing.
+
+Genuinely inert, for a starting point: `jq`, `grep`, `wc`, `cut`, `tr`, `uniq`, `comm`,
+`diff`, `strings`, `xxd`, `base64`, `head`, `tail`, `file`, `stat`. None of them has a flag
+that writes a file or starts a program.
 
 If what you wanted from `python` or `node` was a scratch script to chew on some data,
 [`tinjs`](#tinjs) is that without the general code execution.
@@ -171,6 +186,29 @@ into an exec:
   sets one does not get to use it. `--no-optional-locks` keeps a plain `status` from
   rewriting the index, so the read stays a read.
 
+### `rg` — ripgrep without its exec flags
+
+Much shorter than the git one, because ripgrep is very nearly inert already: it has no
+flag that writes a file, and everything it produces goes to stdout. What it has is two
+flags that hand it a program, and the wrapper is mostly those:
+
+- **`--pre` and `--hostname-bin` are refused**, and `--pre-glob` with them, since it
+  exists only to steer the first. `--pre` runs a command of your choosing on every file
+  before searching it, which is general code execution wearing a search flag.
+- **`--no-config` is passed on every call**, and `RIPGREP_CONFIG_PATH` is unset. A config
+  file can contain `--pre` as easily as a command line can. tin does not carry that
+  variable into a child anyway, but a wrapper that is only correct because of something
+  another file does is a wrapper that breaks quietly when that file changes.
+- **Everything after `--` is left alone**, so a pattern that looks like a flag is still
+  searchable. Before it, an argument that merely resembles one of the refused flags is
+  refused rather than reasoned about.
+
+`-z`/`--search-zip` is deliberately left working. It runs a decompressor, but only one it
+can find on `PATH`, and `PATH` inside tin is the allowlist directory — so it reaches a
+decompressor exactly when you have linked one, which is a decision you already made.
+
+`test/wrapper-rg.test.ts` covers the Node one.
+
 ## tinjs
 
 Models reach for a throwaway script constantly — parse this log, group those records,
@@ -181,7 +219,7 @@ allowlist exists to prevent.
 [`tinjs/`](tinjs) is the way out of that trade: a JavaScript interpreter built so that
 it cannot write. Standard ES2023 is all there — regular expressions with named groups
 and lookbehind, `JSON`, `Map`, `Set`, typed arrays, `Date`, `BigInt`, classes,
-`async`/`await` — plus `read`, `readBytes`, `readStdin`, `print`, `console`, `inspect`,
+`async`/`await` — plus `read`, `readBytes`, `lines`, `print`, `console`, `inspect`,
 `args` and `exit`. Nothing else. There is no function that creates a file, opens a
 socket, starts a process, reads the environment or loads a module, because the engine's
 host bindings are not compiled into the binary at all.
@@ -193,6 +231,16 @@ Once it is there:
 tin_run { command: "tinjs", args: ["-e", "print(JSON.parse(read('package.json')).version)"] }
 ```
 
+`read` wants the whole file in memory, which stops being reasonable around the size of
+the log you actually wanted to search. `lines` is the same read one line at a time, and
+holds only the line it is on:
+
+```
+tin_run { command: "tinjs", args: ["-e",
+  "let n=0; for (const l of lines(args[0])) if (l.includes(' ERROR ')) n++; print(n)",
+  "access.log"] }
+```
+
 Results come back on stdout and nowhere else, so a script prints what it worked out and
 tin's own write tool puts it on disk under the usual check. That is what makes tinjs
 safe to link when `node` is not: it is not trusted to respect the write roots, it is
@@ -201,6 +249,60 @@ incapable of writing, whatever ends up in the script.
 tin recognises the name and tells the model what it is, so linking it is the whole
 setup. [`tinjs/README.md`](tinjs/README.md) has the rest — the limits, what the build
 leaves out and why, and how the vendored engine is updated.
+
+## Capturing output
+
+There is no shell, so there is no `|` and no `>`, and for a long time that meant the only
+way one command's output reached another was through the conversation: the model read it,
+retyped it into a file, and read it back. That works for twenty lines and fails for
+twenty thousand, both on cost and because a model retyping a large payload verbatim gets
+it subtly wrong.
+
+`capture` is the way across. Ask for it and the command's stdout goes to a file instead
+of coming back whole:
+
+```
+tin_run { command: "rg", args: ["--json", "TODO", "src"], capture: true }
+```
+
+```
+rg --json TODO src exited with code 0
+
+stdout was captured to /tmp/tin-4f9a.../1-rg.out (47.2 MB, 310204 lines)
+
+first 30 lines:
+...
+```
+
+The path is what the model does something with — usually hands it straight to the next
+command, which is where `tinjs`'s `lines` comes in, since the whole file never has to fit
+anywhere:
+
+```
+tin_run { command: "tinjs", args: ["summarise.js", "/tmp/tin-4f9a.../1-rg.out"] }
+```
+
+What comes back from a captured run is the shape of the file and its first thirty lines,
+which is enough to see that the command did what was wanted — that it matched something,
+that the output is JSON and not an error page — without paying for the rest of it.
+
+Some details that matter:
+
+- **tin chooses the path, not the model.** That is what keeps this from being redirection
+  by another name: nothing in the call names a destination, so it cannot be pointed at
+  `~/.ssh/authorized_keys`. The directory is created under the OS temp directory on the
+  first capture of a session, with a fresh random name, and it is never writable — it is
+  on the same list as tin's own config and the allowlist directory.
+- **stderr is not in the file.** It comes back in the result as it always has. A capture
+  file is data for another program to read, and a warning interleaved into it corrupts
+  that quietly; a warning in the result is in front of you instead.
+- **tin never deletes a capture file.** A path handed out an hour ago should still work
+  an hour later, so cleanup is the operating system's job, the way it is for everything
+  else in the temp directory. `/tin` prints the directory when you want to look, or to
+  clear it out yourself.
+- **`exec.maxCaptureBytes` is the only bound**, and it is set at 4 GB — high enough that
+  it is a backstop against a runaway rather than a limit you work around. In practice
+  `exec.timeoutMs` stops most things long before it.
 
 ## Windows
 
@@ -258,6 +360,7 @@ falls back to those defaults rather than to something more permissive.
     "timeoutMs": 120000,
     "maxOutputBytes": 100000,
     "maxOutputLines": 2000,
+    "maxCaptureBytes": 4294967296,
     "passEnv": ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TMPDIR"],
     "env": {}
   }
@@ -274,6 +377,10 @@ falls back to those defaults rather than to something more permissive.
   configuration: `.git` (hooks), `.pi` (project extensions and settings), `.agents` (skills).
 - **`allowTools`** — extra tool names to let through the gate, for tools from other
   extensions you trust.
+- **`exec.maxCaptureBytes`** — the ceiling on one [capture](#capturing-output) file. A
+  different kind of limit from `maxOutputBytes` and `maxOutputLines` above it: those keep
+  a command's output from swamping the conversation, this one only keeps a runaway from
+  filling the disk, so it is set where a mistake is still caught and a real log is not.
 
 One setting also has an environment variable, `TIN_EXTRA_WRITE_ROOTS`: a delimiter-separated
 list of directories, in the shape of `PATH`, *added* to whatever `writeRoots` resolved to
@@ -287,6 +394,8 @@ The config is read from your home directory and never from the project, because 
 can write in the project — a project-local policy file would be a policy the model edits.
 For the same reason the config file itself and `binDir` are never writable, whatever the
 write roots say: those two are how the policy gets rewritten rather than worked within.
+The capture directory is on that list too — its contents are how one command's output
+reaches the next, so a session that could rewrite one could launder a result past you.
 
 tin's own source is not on that list, and does not need to be. The write roots already
 answer the question: work anywhere else and this repository is not a root, so it is safe
@@ -305,14 +414,19 @@ by not being one; work inside it and editing it is the whole reason you are ther
   `NUMBER_OF_PROCESSORS` and `PROCESSOR_ARCHITECTURE`, without which most programs there
   fail in ways that are hard to read. Setting `passEnv` yourself replaces the whole list,
   Windows names included.
-- stdin is closed, so nothing sits waiting for input.
+- stdin is closed, so nothing sits waiting for input. Nothing is piped in either: a
+  command that only reads stdin has no way to be fed, and the way output travels between
+  commands is [capture](#capturing-output) and a path.
 - The command runs in a session of its own, and is killed as a process group on timeout or
   when you press Esc — killing just the child would leave its children running and holding
   the pipes. The session also means no controlling terminal, so an allowed command cannot
   open `/dev/tty` to reach the terminal you are sitting at. Windows has neither, so the
   tree is killed with `taskkill /T` there instead.
 
-Output is capped by bytes and lines, and the model is told when it was truncated.
+Output is capped by bytes and lines, and the model is told when it was truncated. A run
+that asked to [capture](#capturing-output) writes its stdout to a file as well, and gets
+back the path and the first lines rather than the whole thing; that file is bounded only
+by `exec.maxCaptureBytes`.
 
 ## What tin is not
 

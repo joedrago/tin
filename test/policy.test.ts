@@ -108,7 +108,7 @@ test("tin's own source is writable when it is where you are working", () => {
 	// does not need to: the write roots already answer the question, and a session
 	// pointed at this repository is one that means to edit it.
 	const fx = fixture();
-	assert.deepEqual(fx.policy.denyPaths, [fx.policy.configPath, fx.binDir]);
+	assert.deepEqual(fx.policy.denyPaths, [fx.policy.configPath, fx.binDir, fx.policy.captureDir]);
 	assert.equal(checkWritePath(path.join(fx.workspace, "src", "policy.ts"), fx.policy, fx.workspace).allow, true);
 });
 
@@ -167,9 +167,12 @@ test("the tinjs blurb states what is not there, so the model does not go looking
 		assert.ok(blurb.includes(capability), `blurb should rule out: ${capability}`);
 	}
 	// And what it does have, since that is what saves the wasted first attempt.
-	for (const api of ["read(path)", "readBytes(path)", "readStdin()", "print(...)", "exit(code)"]) {
+	for (const api of ["read(path)", "readBytes(path)", "lines(path)", "print(...)", "exit(code)"]) {
 		assert.ok(blurb.includes(api), `blurb should offer: ${api}`);
 	}
+	// readStdin is gone: tin closes stdin, so a model told about it would get an
+	// empty string and no sign that anything had gone wrong.
+	assert.ok(!blurb.includes("readStdin"));
 });
 
 test("the tinjs blurb does not describe limits tinjs no longer imposes", () => {

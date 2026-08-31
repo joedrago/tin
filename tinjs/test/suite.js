@@ -145,6 +145,46 @@ eq("readBytes handles NUL and 0xff", Array.from(bytes.slice(6)), [0x00, 0x01, 0x
 eq("read decodes utf8", read(`${fixtures}/bytes.bin`).slice(0, 4), "café");
 throws("read of a missing file throws", () => read(`${fixtures}/nope-does-not-exist`));
 
+// lines(): the same reads, one line at a time, for files too big to hold. The
+// whole point is that nothing here accumulates, so what is checked is the
+// boundaries — terminators, a last line without one, and blank lines in between.
+eq("lines counts a file", [...lines(`${fixtures}/log.txt`)].length, 5);
+ok("lines strips the terminator", [...lines(`${fixtures}/log.txt`)].every((l) => !l.includes("\n") && !l.endsWith("\r")));
+eq("lines matches split, without the trailing empty", [...lines(`${fixtures}/log.txt`)], read(`${fixtures}/log.txt`).split("\n").slice(0, -1));
+eq(
+	"lines handles CRLF, blanks and a missing final newline",
+	[...lines(`${fixtures}/crlf.txt`)],
+	["first", "second", "", "fourth"],
+);
+eq("lines of an empty read is empty", [...lines(`${fixtures}/empty.txt`)], []);
+throws("lines of a missing file throws", () => lines(`${fixtures}/nope-does-not-exist`));
+
+// Each call is its own walk: two iterators over one path do not share a position,
+// and starting over is just calling lines() again rather than a rewind.
+const walkA = lines(`${fixtures}/crlf.txt`);
+const walkB = lines(`${fixtures}/crlf.txt`);
+eq("independent iterators", [walkA.next().value, walkB.next().value, walkA.next().value], [
+	"first",
+	"first",
+	"second",
+]);
+
+// Leaving a for..of early has to close the file, which happens through the
+// iterator protocol's return(). It is not observable from in here, but that the
+// loop can be left and the path walked again at all is.
+let firstOnly = "";
+for (const line of lines(`${fixtures}/crlf.txt`)) {
+	firstOnly = line;
+	break;
+}
+eq("break leaves the loop", firstOnly, "first");
+eq("and the file can be walked again", [...lines(`${fixtures}/crlf.txt`)].length, 4);
+ok("lines is iterable more than once per call", typeof lines(`${fixtures}/log.txt`)[Symbol.iterator] === "function");
+
+// readStdin is gone. Under tin stdin is always closed, so it could only ever
+// return "" — a binding that cannot work is worse than no binding at all.
+ok("no readStdin", typeof globalThis.readStdin === "undefined");
+
 ok("args is an array", Array.isArray(args));
 
 // inspect: quoted inside structures, and cycles do not hang.

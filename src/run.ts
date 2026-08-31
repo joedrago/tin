@@ -1,6 +1,16 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { lstatSync, readdirSync, realpathSync, type Stats, statSync } from "node:fs";
+import {
+	createWriteStream,
+	lstatSync,
+	mkdirSync,
+	readdirSync,
+	realpathSync,
+	type Stats,
+	statSync,
+	type WriteStream,
+} from "node:fs";
 import path from "node:path";
+import type { Readable } from "node:stream";
 import type { TinPolicy } from "./config.ts";
 import { canonicalize, isInside } from "./paths.ts";
 
@@ -132,6 +142,14 @@ export function resolveWorkingDirectory(
 	return resolved;
 }
 
+export interface CaptureOutcome {
+	path: string;
+	bytes: number;
+	lines: number;
+	/** The command outran maxCaptureBytes and the file stops short of its output. */
+	truncated: boolean;
+}
+
 export interface ExecOutcome {
 	stdout: string;
 	stderr: string;
@@ -140,6 +158,8 @@ export interface ExecOutcome {
 	timedOut: boolean;
 	truncated: boolean;
 	durationMs: number;
+	/** Present when the run was asked to capture; absent when it was not. */
+	capture?: CaptureOutcome;
 }
 
 interface Capture {
@@ -180,6 +200,11 @@ function finish(sink: Capture, maxLines: number): { text: string; truncated: boo
 }
 
 const KILL_GRACE_MS = 2_000;
+
+// How long to wait for a capture file to flush once the command is over. The path
+// is handed back as something to read, so it has to be on disk before this call
+// resolves; this bounds the wait if the stream never closes.
+const CAPTURE_FLUSH_GRACE_MS = 5_000;
 
 // How long to wait for the output pipes once the child itself has exited. Anything
 // that got out of the kill — a grandchild that called setsid, or on Windows one that
@@ -295,6 +320,149 @@ export function buildLaunch(command: ResolvedCommand, args: string[]): Launch {
 }
 
 /**
+ * The file a captured run's stdout is written to as it arrives.
+ *
+ * Capture exists so that a command's output does not have to fit in the
+ * conversation to be useful: it goes to disk, and the model is handed the path to
+ * give to the next command. So this counts what goes past rather than keeping it,
+ * and the only memory involved is the stream's own queue — which is why the child
+ * is paused whenever that queue is full. Without that, a fast producer would turn
+ * a bounded file into unbounded memory, which is the problem capture was meant to
+ * solve.
+ *
+ * stderr is deliberately not part of this. A capture file is data for another
+ * program to read, and a warning interleaved into it corrupts that quietly; the
+ * tool result is where stderr belongs, in front of the person and the model.
+ */
+class CaptureFile {
+	bytes = 0;
+	lines = 0;
+	truncated = false;
+	/** The first write error, if the file stopped being writable partway. */
+	failure: Error | undefined;
+
+	readonly path: string;
+
+	private readonly limit: number;
+	private readonly source: Readable;
+	private readonly stream: WriteStream;
+	private endedWithNewline = true;
+	private closed = false;
+	private paused = false;
+
+	constructor(target: string, limit: number, source: Readable) {
+		this.path = target;
+		this.limit = limit;
+		this.source = source;
+		this.stream = createWriteStream(target, { mode: 0o600 });
+		this.stream.on("error", (error: Error) => {
+			this.failure ??= error;
+		});
+		this.stream.on("close", () => {
+			this.closed = true;
+		});
+	}
+
+	write(chunk: Buffer): void {
+		if (this.failure !== undefined) return;
+		if (this.bytes >= this.limit) {
+			this.truncated = true;
+			return;
+		}
+
+		let piece = chunk;
+		if (this.bytes + chunk.length > this.limit) {
+			piece = chunk.subarray(0, this.limit - this.bytes);
+			this.truncated = true;
+		}
+		this.bytes += piece.length;
+
+		// indexOf rather than a walk over the bytes: this runs on every chunk of a
+		// file that may be gigabytes, and the line count is only used to describe it.
+		for (let at = piece.indexOf(0x0a); at !== -1; at = piece.indexOf(0x0a, at + 1)) this.lines++;
+		if (piece.length > 0) this.endedWithNewline = piece[piece.length - 1] === 0x0a;
+
+		if (!this.stream.write(piece)) {
+			this.paused = true;
+			this.source.pause();
+			this.stream.once("drain", () => {
+				this.paused = false;
+				this.source.resume();
+			});
+		}
+	}
+
+	/** True while there are bytes on their way to disk that have not arrived yet. */
+	get inFlight(): boolean {
+		return this.paused || this.stream.writableLength > 0;
+	}
+
+	/** How much is queued, so a caller can tell moving from wedged. */
+	get queued(): number {
+		return this.stream.writableLength;
+	}
+
+	/** Lines as a person counts them: a last line with no newline is still a line. */
+	get lineCount(): number {
+		return this.lines + (this.bytes > 0 && !this.endedWithNewline ? 1 : 0);
+	}
+
+	/**
+	 * Close the file and wait for it to actually be on disk.
+	 *
+	 * The path is about to be handed to the model as something to read, so
+	 * resolving before the stream has flushed would hand back a file that is
+	 * quietly short. "close" covers both endings, since autoClose emits it after a
+	 * failure as well as after a clean finish.
+	 */
+	finish(): Promise<void> {
+		return new Promise<void>((resolve) => {
+			if (this.closed) {
+				resolve();
+				return;
+			}
+			this.stream.once("close", () => resolve());
+			this.stream.end();
+			setTimeout(resolve, CAPTURE_FLUSH_GRACE_MS).unref();
+		});
+	}
+}
+
+/**
+ * Create the capture directory if this session has not captured yet, and name the
+ * file this run will write to.
+ *
+ * mkdir rather than a recursive create: the parent is the OS temp directory,
+ * which is shared, and a plain mkdir fails if anything is already at the name
+ * instead of following it somewhere else. 0700 keeps the contents to the user
+ * whose output it is.
+ *
+ * The name carries a sequence number and the command, which are for the person
+ * reading `ls` later; the command name has already been through COMMAND_NAME, so
+ * it holds no separator and cannot climb out of the directory.
+ */
+export function nextCapturePath(policy: TinPolicy, command: string): string {
+	try {
+		mkdirSync(policy.captureDir, { mode: 0o700 });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+			throw new TinDenied(
+				`tin: cannot create the capture directory ${policy.captureDir}: ${(error as Error).message}`,
+			);
+		}
+	}
+	captureSequence += 1;
+	return path.join(policy.captureDir, `${captureSequence}-${command}.out`);
+}
+
+/** Start the run numbering over. Called when a session starts, and by tests. */
+export function resetCaptureSequence(): void {
+	captureSequence = 0;
+}
+
+let captureSequence = 0;
+
+/**
  * Run an allowed command with an argument array. No shell is involved, so the
  * arguments reach the process verbatim: no globbing, no expansion, no redirection,
  * no command substitution. stdin is closed so nothing can wait for input.
@@ -313,7 +481,14 @@ export function buildLaunch(command: ResolvedCommand, args: string[]): Launch {
 export function execCommand(
 	command: ResolvedCommand,
 	args: string[],
-	options: { cwd: string; env: Record<string, string>; policy: TinPolicy; signal?: AbortSignal },
+	options: {
+		cwd: string;
+		env: Record<string, string>;
+		policy: TinPolicy;
+		signal?: AbortSignal;
+		/** Where to write stdout as it arrives. Absent for an uncaptured run. */
+		capturePath?: string;
+	},
 	onData?: (stream: "stdout" | "stderr", text: string) => void,
 ): Promise<ExecOutcome> {
 	const { exec } = options.policy;
@@ -334,6 +509,10 @@ export function execCommand(
 
 		const out = capture();
 		const err = capture();
+		const file =
+			options.capturePath === undefined
+				? undefined
+				: new CaptureFile(options.capturePath, exec.maxCaptureBytes, child.stdout);
 		let timedOut = false;
 		let settled = false;
 		let exitCode: number | null = null;
@@ -378,6 +557,7 @@ export function execCommand(
 		child.stdout.on("data", (chunk: Buffer) => {
 			append(out, chunk, exec.maxOutputBytes);
 			onData?.("stdout", chunk.toString("utf8"));
+			file?.write(chunk);
 		});
 		child.stderr.on("data", (chunk: Buffer) => {
 			append(err, chunk, exec.maxOutputBytes);
@@ -394,14 +574,37 @@ export function execCommand(
 			cleanup();
 			const stdout = finish(out, exec.maxOutputLines);
 			const stderr = finish(err, exec.maxOutputLines);
-			resolve({
-				stdout: stdout.text,
-				stderr: stderr.text,
-				exitCode,
-				signal: exitSignal,
-				timedOut,
-				truncated: stdout.truncated || stderr.truncated,
-				durationMs: Date.now() - startedAt,
+
+			// A capture file is about to be named to the model as something to read,
+			// so the run is not over until the bytes are actually on disk. There is
+			// nothing to wait for when the run was not capturing.
+			const flushed = file ? file.finish() : Promise.resolve();
+			flushed.then(() => {
+				if (file?.failure !== undefined) {
+					reject(
+						new Error(
+							`tin: capturing ${command.name} to ${file.path} failed after ${file.bytes} bytes: ${file.failure.message}`,
+						),
+					);
+					return;
+				}
+				resolve({
+					stdout: stdout.text,
+					stderr: stderr.text,
+					exitCode,
+					signal: exitSignal,
+					timedOut,
+					truncated: stdout.truncated || stderr.truncated,
+					durationMs: Date.now() - startedAt,
+					capture: file
+						? {
+								path: file.path,
+								bytes: file.bytes,
+								lines: file.lineCount,
+								truncated: file.truncated,
+							}
+						: undefined,
+				});
 			});
 		};
 
@@ -417,15 +620,73 @@ export function execCommand(
 		child.on("exit", (code, signal) => {
 			exitCode = code;
 			exitSignal = signal;
-			timers.push(
-				setTimeout(() => {
-					child.stdout?.destroy();
-					child.stderr?.destroy();
-					settle();
-				}, PIPE_GRACE_MS).unref(),
-			);
+
+			// A capture that is still moving bytes onto disk is not what this timer is
+			// for — it is here for a grandchild holding the pipes — and cutting the
+			// pipes mid-drain would leave a file quietly short of the output it is
+			// supposed to be. So it gets another interval for as long as the queue is
+			// going down, and the check on the queue standing still is what keeps a
+			// wedged device from holding the call open forever.
+			let lastQueued = -1;
+			const stopWaiting = () => {
+				if (file?.inFlight === true && file.queued !== lastQueued) {
+					lastQueued = file.queued;
+					timers.push(setTimeout(stopWaiting, PIPE_GRACE_MS).unref());
+					return;
+				}
+				child.stdout?.destroy();
+				child.stderr?.destroy();
+				settle();
+			};
+			timers.push(setTimeout(stopWaiting, PIPE_GRACE_MS).unref());
 		});
 	});
+}
+
+/** How many lines of a capture file to show, as an idea of what landed in it. */
+const CAPTURE_PREVIEW_LINES = 30;
+
+function describeBytes(bytes: number): string {
+	if (bytes < 1024) return `${bytes} B`;
+	const units = ["KB", "MB", "GB", "TB"];
+	let value = bytes / 1024;
+	let unit = 0;
+	while (value >= 1024 && unit < units.length - 1) {
+		value /= 1024;
+		unit++;
+	}
+	return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
+}
+
+/**
+ * Describe a capture file instead of pasting what is in it.
+ *
+ * The point of capturing is that the output does not have to come back through
+ * the conversation, so quoting it here would undo the whole thing. What does come
+ * back is the shape of it — where, how big, how many lines — and enough of the
+ * top to tell at a glance whether the command produced what was wanted, which is
+ * the difference between noticing a mistake now and noticing it two calls later
+ * inside something that could not parse it.
+ */
+function describeCapture(capture: CaptureOutcome, stdout: string): string[] {
+	const parts: string[] = [];
+	const size = `${describeBytes(capture.bytes)}, ${capture.lines} line${capture.lines === 1 ? "" : "s"}`;
+	parts.push(
+		capture.truncated
+			? `stdout was captured to ${capture.path} (${size}), truncated at tin's capture ceiling — the command produced more than the file holds`
+			: `stdout was captured to ${capture.path} (${size})`,
+	);
+
+	const lines = stdout.split("\n");
+	const shown = lines.slice(0, CAPTURE_PREVIEW_LINES).join("\n").trimEnd();
+	if (shown !== "") {
+		parts.push(
+			lines.length > CAPTURE_PREVIEW_LINES || capture.lines > CAPTURE_PREVIEW_LINES
+				? `first ${CAPTURE_PREVIEW_LINES} lines:\n${shown}`
+				: `stdout:\n${shown}`,
+		);
+	}
+	return parts;
 }
 
 /** Render an outcome as the text the model sees. */
@@ -441,10 +702,21 @@ export function formatOutcome(command: string, args: string[], outcome: ExecOutc
 		parts.push(`${invocation} exited with code ${outcome.exitCode ?? "unknown"}`);
 	}
 
-	if (outcome.stdout.trim() !== "") parts.push(`stdout:\n${outcome.stdout.trimEnd()}`);
+	if (outcome.capture) {
+		parts.push(...describeCapture(outcome.capture, outcome.stdout));
+	} else if (outcome.stdout.trim() !== "") {
+		parts.push(`stdout:\n${outcome.stdout.trimEnd()}`);
+	}
+
+	// stderr comes back whether or not stdout was captured. It is usually small, it
+	// is what says why a command failed, and keeping it out of the capture file is
+	// what keeps that file parseable by whatever reads it next.
 	if (outcome.stderr.trim() !== "") parts.push(`stderr:\n${outcome.stderr.trimEnd()}`);
-	if (outcome.stdout.trim() === "" && outcome.stderr.trim() === "") parts.push("(no output)");
-	if (outcome.truncated) {
+
+	if (!outcome.capture && outcome.stdout.trim() === "" && outcome.stderr.trim() === "") {
+		parts.push("(no output)");
+	}
+	if (outcome.truncated && !outcome.capture) {
 		parts.push("[output truncated by tin — re-run with narrower arguments to see the rest]");
 	}
 

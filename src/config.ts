@@ -1,4 +1,6 @@
+import { randomBytes } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { canonicalize, expandTilde, isInside } from "./paths.ts";
 
@@ -20,6 +22,8 @@ export interface TinConfigFile {
 		timeoutMs?: number;
 		maxOutputBytes?: number;
 		maxOutputLines?: number;
+		/** Ceiling on a captured output file. Far larger than the in-context caps. */
+		maxCaptureBytes?: number;
 		/** Environment variables copied from pi's own environment into the child. */
 		passEnv?: string[];
 		/** Environment variables set explicitly on the child. */
@@ -31,6 +35,7 @@ export interface TinExecPolicy {
 	timeoutMs: number;
 	maxOutputBytes: number;
 	maxOutputLines: number;
+	maxCaptureBytes: number;
 	passEnv: string[];
 	env: Record<string, string>;
 }
@@ -48,6 +53,12 @@ export interface TinPolicy {
 	denyPaths: string[];
 	/** Where allowed commands are symlinked from. */
 	binDir: string;
+
+	// Where a captured command's stdout is written, for the sessions that capture
+	// any. The name is settled here and the directory is created on first use, so
+	// a session that never captures leaves nothing behind at all.
+	captureDir: string;
+
 	/** False when binDir is missing or unsafe; tin_run then refuses everything. */
 	execEnabled: boolean;
 	/** Extra tool names allowed through the gate. */
@@ -93,6 +104,14 @@ const DEFAULT_EXEC: TinExecPolicy = {
 	timeoutMs: 120_000,
 	maxOutputBytes: 100_000,
 	maxOutputLines: 2_000,
+
+	// The ceiling on a capture file, which is a different kind of limit from the
+	// two above it: those keep a command's output from swamping the conversation,
+	// this one only keeps a runaway from filling the disk. It is meant never to be
+	// reached in ordinary work, so it is set where a mistake is still caught and a
+	// real log is not. In practice exec.timeoutMs binds first for most commands.
+	maxCaptureBytes: 4 * 1024 ** 3,
+
 	passEnv: DEFAULT_PASS_ENV,
 	env: {},
 };
@@ -112,9 +131,29 @@ export interface BuildPolicyOptions {
 	extraWriteRoots?: string[];
 	/** Override the config file location (tests). */
 	configPath?: string;
+	/** Override where captured output would go (tests). */
+	captureDir?: string;
 	/** Injected for tests. */
 	readFile?: (p: string) => string;
 	isDirectory?: (p: string) => boolean;
+}
+
+/**
+ * Name the directory this session would capture output into.
+ *
+ * It sits under the OS temp directory rather than inside a write root, which
+ * settles three things at once: capture adds nothing to what the model may write,
+ * a result cannot be rewritten after the fact to say something it did not say,
+ * and reads are unrestricted anyway, so tinjs and the read tool reach a capture
+ * file without needing a special case for it.
+ *
+ * Nothing is created here. The name is random rather than derived from the
+ * session so that two sessions cannot collide, and the directory is made on the
+ * first capture — with mkdir, which fails rather than follows if something is
+ * already sitting at the name.
+ */
+function defaultCaptureDir(): string {
+	return path.join(os.tmpdir(), `tin-${randomBytes(9).toString("hex")}`);
 }
 
 function defaultIsDirectory(p: string): boolean {
@@ -241,12 +280,17 @@ export function buildPolicy(options: BuildPolicyOptions): TinPolicy {
 	// what may be written: if you are working somewhere else, this repository is not
 	// a root and is safe by not being one, and if you are working in it, editing it
 	// is the entire point of being there.
-	const denyPaths = [configPath, binDir];
+	// The capture directory joins them. Its contents are how a command's output is
+	// handed to the next command, so a session that could rewrite one could launder
+	// a result past the person reading the transcript.
+	const captureDir = options.captureDir ?? defaultCaptureDir();
+	const denyPaths = [configPath, binDir, captureDir];
 
 	const exec: TinExecPolicy = {
 		timeoutMs: positiveNumber(file.exec?.timeoutMs, DEFAULT_EXEC.timeoutMs),
 		maxOutputBytes: positiveNumber(file.exec?.maxOutputBytes, DEFAULT_EXEC.maxOutputBytes),
 		maxOutputLines: positiveNumber(file.exec?.maxOutputLines, DEFAULT_EXEC.maxOutputLines),
+		maxCaptureBytes: positiveNumber(file.exec?.maxCaptureBytes, DEFAULT_EXEC.maxCaptureBytes),
 		passEnv: stringArray(file.exec?.passEnv) ?? DEFAULT_EXEC.passEnv,
 		env: typeof file.exec?.env === "object" && file.exec.env ? file.exec.env : {},
 	};
@@ -258,6 +302,7 @@ export function buildPolicy(options: BuildPolicyOptions): TinPolicy {
 		denySegments,
 		denyPaths,
 		binDir,
+		captureDir,
 		execEnabled,
 		allowTools: stringArray(file.allowTools) ?? [],
 		exec,

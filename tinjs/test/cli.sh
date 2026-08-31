@@ -75,8 +75,31 @@ check_err "memory limit"         1 "memory"  "$TINJS" --memory 16 -e 'const a = 
 
 # Reading works; writing does not exist to be tried.
 check "read a fixture"  0 "4" "$TINJS" -e 'print(JSON.parse(read(args[0])).length)' "$HERE/fixtures/people.json"
-check "stdin"           0 "piped" sh -c "echo piped | '$TINJS' -e 'print(readStdin().trim())'"
-check "closed stdin"    0 "0"     sh -c "'$TINJS' -e 'print(readStdin().length)' </dev/null"
+
+# stdin is not a channel any more: tin closes it, so a binding for it could only
+# ever hand back an empty string. Nothing should be listening on it.
+check "no readStdin" 0 "undefined" "$TINJS" -e 'print(typeof readStdin)'
+
+# lines() is the reason read() no longer has to be the only way in. What a script
+# cannot check about itself is that the walk is genuinely incremental, so this
+# builds a file much larger than a memory limit and then does both under it: the
+# walk finishes, and slurping the same file dies. If lines() ever starts holding
+# the file, the first of these fails the way the second one does.
+BIG=$(mktemp)
+printf 'x%.0s' $(seq 1 1023) > "$BIG"
+printf '\n' >> "$BIG"
+i=0
+while [ $i -lt 14 ]; do          # 1KB doubled fourteen times is 16MB
+	cat "$BIG" "$BIG" > "$BIG.2" && mv "$BIG.2" "$BIG"
+	i=$((i + 1))
+done
+
+check "lines walks a file bigger than the heap limit" 0 "16384" \
+	"$TINJS" --memory 8 -e 'let n = 0; for (const l of lines(args[0])) n++; print(n)' "$BIG"
+check_err "read of the same file runs out" 1 "memory" \
+	"$TINJS" --memory 8 -e 'print(read(args[0]).length)' "$BIG"
+
+rm -f "$BIG" "$BIG.2"
 
 echo "cli: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

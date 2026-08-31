@@ -10,6 +10,7 @@ export interface Fixture {
 	workspace: string;
 	binDir: string;
 	outside: string;
+	captureDir: string;
 	policy: TinPolicy;
 }
 
@@ -20,6 +21,7 @@ export interface Fixture {
  *   <root>/home/work/          the workspace (write root)
  *   <root>/home/work/escape -> <root>/outside   a symlink out of the workspace
  *   <root>/outside/            everything the model must not reach
+ *   <root>/captures/           where capture would write, deliberately not created
  */
 export function fixture(config?: Record<string, unknown>): Fixture {
 	// Canonicalized up front: buildPolicy resolves symlinks, and on macOS the temp
@@ -31,6 +33,9 @@ export function fixture(config?: Record<string, unknown>): Fixture {
 	const workspace = path.join(home, "work");
 	const binDir = path.join(home, "tinbin");
 	const outside = path.join(root, "outside");
+	// Named but not created: making it on first use is part of what is under test,
+	// and a session that captures nothing should leave nothing behind.
+	const captureDir = path.join(root, "captures");
 
 	for (const dir of [agentDir, workspace, binDir, outside, path.join(workspace, ".git")]) {
 		mkdirSync(dir, { recursive: true });
@@ -41,8 +46,8 @@ export function fixture(config?: Record<string, unknown>): Fixture {
 	const configPath = path.join(agentDir, "tin.json");
 	if (config) writeFileSync(configPath, JSON.stringify(config));
 
-	const policy = buildPolicy({ cwd: workspace, home, agentDir, configPath });
-	return { root, home, agentDir, workspace, binDir, outside, policy };
+	const policy = buildPolicy({ cwd: workspace, home, agentDir, configPath, captureDir });
+	return { root, home, agentDir, workspace, binDir, outside, captureDir, policy };
 }
 
 /** Link a real executable into the fixture's allowlist directory. */

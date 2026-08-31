@@ -129,11 +129,51 @@
 		error: (...args) => writeErr(format(args)),
 	};
 
-	// The three ways data gets in. There is deliberately no counterpart that puts
-	// any back out to disk: stdout is the only channel tinjs writes to.
+	/**
+	 * Walk a file one line at a time, without holding it all in memory.
+	 *
+	 * Each call opens the file and returns its own iterator, so two walks of the
+	 * same path do not interfere and starting again from the top is just calling
+	 * lines() again — there is no rewind, and no shared position to corrupt. The
+	 * handle stays captured in here: what the caller gets is an iterator and
+	 * nothing else, so there is no object with a file behind it loose in the
+	 * script.
+	 *
+	 * The file is closed when the last line has been read, and when a for..of
+	 * loop is left early — break, return and throw all reach return() through the
+	 * iterator protocol. An iterator that is simply abandoned is closed when it is
+	 * collected, and at worst when the process exits.
+	 */
+	globalThis.lines = function lines(path) {
+		const handle = raw.openLines(path);
+		let done = false;
+		return {
+			next() {
+				if (done) return { value: undefined, done: true };
+				const line = raw.nextLine(handle);
+				if (line === null) {
+					done = true;
+					return { value: undefined, done: true };
+				}
+				return { value: line, done: false };
+			},
+			return(value) {
+				if (!done) {
+					done = true;
+					raw.closeLines(handle);
+				}
+				return { value, done: true };
+			},
+			[Symbol.iterator]() {
+				return this;
+			},
+		};
+	};
+
+	// The ways data gets in. There is deliberately no counterpart that puts any
+	// back out to disk: stdout is the only channel tinjs writes to.
 	globalThis.read = raw.read;
 	globalThis.readBytes = raw.readBytes;
-	globalThis.readStdin = raw.readStdin;
 
 	globalThis.exit = raw.exit;
 	globalThis.args = raw.args;

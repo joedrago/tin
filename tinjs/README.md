@@ -23,12 +23,12 @@ Standard JavaScript, essentially all of it. The engine is
 [quickjs-ng](https://github.com/quickjs-ng/quickjs), so that means ES2023: regular
 expressions with named groups, lookbehind and unicode property escapes; `JSON`;
 `Map`, `Set`, `WeakMap`; typed arrays; `Date`; `BigInt`; classes with private
-fields; generators; destructuring; `async`/`await`; `atob`/`btoa`. Seventy-eight
-globals, and every one of them is either ECMAScript or one of the eight below.
+fields; generators; destructuring; `async`/`await`; `atob`/`btoa`. Every global is
+either ECMAScript or one of the ones below.
 
     read(path)         file contents as a string
     readBytes(path)    file contents as a Uint8Array
-    readStdin()        all of stdin as a string
+    lines(path)        the file one line at a time, without holding it
     print(...)         a line on stdout
     console.log/error  the same, and its stderr counterpart
     inspect(value)     the string print would have produced
@@ -38,6 +38,41 @@ globals, and every one of them is either ECMAScript or one of the eight below.
 Reads are unrestricted, the same as everywhere else in tin: it is all your own
 machine. `read` decodes UTF-8; `readBytes` returns a copy of the bytes, so writing
 into the array it hands back changes nothing on disk.
+
+### Walking a file that does not fit
+
+`read` wants the whole file in memory, which stops being reasonable somewhere
+around the log you actually wanted to grep. `lines` is the same read taken one
+line at a time:
+
+```js
+let errors = 0;
+for (const line of lines("access.log")) {
+    if (line.includes(" 500 ")) errors++;
+}
+print(errors);
+```
+
+At any moment that holds one line and a small window of the file, whatever the
+file's size — a million lines is a fraction of a second, and the memory limit
+never comes into it.
+
+Each call opens the file and returns its own iterator, so two walks of the same
+path have their own positions and cannot disturb each other. There is no rewind
+and no seek: starting again from the top is calling `lines` again. The file is
+closed when the last line has been read and when a loop is left early — `break`,
+`return` and `throw` all reach it through the iterator protocol — and an
+iterator that is simply dropped is closed when it is collected, at the latest
+when the process exits.
+
+Terminators are not part of what you get: `\n` is stripped, and so is the `\r`
+in front of it, so a file with CRLF endings reads the same as one without. A
+last line with no newline after it is still a line, and blank lines come back as
+empty strings rather than being skipped.
+
+There is deliberately no byte-wise counterpart. `lines` exists because logs and
+records are line-oriented; a general streaming API would be a larger surface for
+a case that has not come up.
 
 ## What is not in it
 
@@ -70,6 +105,12 @@ stdout is the only channel. A script prints what it worked out, tin's `tin_run`
 hands that back, and anything that needs to land on disk is written by tin's own
 write tool, under the write-root check like every other write.
 
+tin's `capture` puts that stdout in a file rather than in the reply, which is how
+one command's output becomes the next one's input. It changes nothing here: the
+path is tin's choice, not the script's, and a script that prints has no idea
+whether anything is catching it. tinjs still cannot name a destination, because
+it still has no call that names one.
+
 This is deliberate, and it is why tinjs is safe to link even though a general
 interpreter is not. tinjs is not trusted to respect the write roots — it is
 incapable of writing at all, so the question never arises. It stays true no matter
@@ -94,7 +135,10 @@ backtracking is stopped rather than merely regretted.
 Two bounds are not part of that pair and stay on, because neither is a policy so
 much as a way of failing legibly: the JS stack limit, so deep recursion raises a
 `RangeError` instead of running off the native stack, and a 512 MB ceiling on a
-single `read`, which covers a malloc that the JS heap limit would not have.
+single `read`, which covers a malloc that the JS heap limit would not have. That
+same ceiling applies to one line from `lines`: a "line" that long is a file with
+no newlines in it, which is the case `read` already refuses, and the two failing
+at the same size is one number to remember instead of two.
 
 ## Building
 

@@ -1,3 +1,4 @@
+import { readdirSync } from "node:fs";
 import path from "node:path";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import os from "node:os";
@@ -16,6 +17,8 @@ import {
 	execCommand,
 	formatOutcome,
 	listCommands,
+	nextCapturePath,
+	resetCaptureSequence,
 	resolveCommand,
 	resolveWorkingDirectory,
 	TinDenied,
@@ -51,6 +54,12 @@ const runSchema = Type.Object({
 	cwd: Type.Optional(
 		Type.String({ description: "Working directory. Must be inside a writable root." }),
 	),
+	capture: Type.Optional(
+		Type.Boolean({
+			description:
+				"Write this command's stdout to a file instead of returning all of it. The result gives you the file's path, size and first lines; pass that path to another command (tinjs reads a large file with lines()) to work on the whole thing. Use it when the output is large or is meant as input to the next step. stderr comes back either way.",
+		}),
+	),
 });
 
 export interface TinRunDetails {
@@ -63,6 +72,9 @@ export interface TinRunDetails {
 	timedOut: boolean;
 	truncated: boolean;
 	durationMs: number;
+	/** Where stdout was captured, when it was. */
+	capturePath?: string;
+	captureBytes?: number;
 }
 
 export default function tin(pi: ExtensionAPI) {
@@ -91,6 +103,7 @@ export default function tin(pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use tin_run instead of bash; the bash and powershell tools are disabled in this session.",
 			"tin_run takes a bare command name plus an args array. Shell syntax such as |, >, && and $(...) is not interpreted and will be passed through as literal arguments.",
+			"There is no pipe, but capture: true is how output reaches another command: it writes stdout to a file and gives you the path, which you then pass as an argument to the next one. Reach for it when output is large or is the input to a later step, rather than pulling it all back through the conversation.",
 		],
 		parameters: runSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -107,10 +120,12 @@ export default function tin(pi: ExtensionAPI) {
 				details: undefined,
 			});
 
+			const capturePath = params.capture ? nextCapturePath(active, params.command) : undefined;
+
 			const outcome = await execCommand(
 				command,
 				args,
-				{ cwd, env: buildChildEnv(active), policy: active, signal },
+				{ cwd, env: buildChildEnv(active), policy: active, signal, capturePath },
 				(_stream, text) => onUpdate?.({ content: [{ type: "text", text }], details: undefined }),
 			);
 
@@ -125,6 +140,8 @@ export default function tin(pi: ExtensionAPI) {
 					timedOut: outcome.timedOut,
 					truncated: outcome.truncated,
 					durationMs: outcome.durationMs,
+					capturePath: outcome.capture?.path,
+					captureBytes: outcome.capture?.bytes,
 				},
 			};
 		},
@@ -132,6 +149,7 @@ export default function tin(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		policy = undefined;
+		resetCaptureSequence();
 		const active = policyFor(ctx);
 
 		// Take bash, powershell, and anything else unexpected out of the model's view
@@ -183,6 +201,7 @@ export default function tin(pi: ExtensionAPI) {
 					? [`  of which ${active.extraWriteRoots.join(", ")} came from ${EXTRA_ROOTS_ENV}`]
 					: []),
 				`protected   ${active.denySegments.join(", ")} + ${active.denyPaths.join(", ")}`,
+				`captures    ${captureState(active.captureDir)}`,
 				`commands    ${active.execEnabled ? active.binDir : "(execution disabled)"}`,
 				`            ${commands.join(", ") || "(none linked)"}`,
 				...active.warnings.map((warning) => `warning     ${warning}`),
@@ -190,6 +209,23 @@ export default function tin(pi: ExtensionAPI) {
 			ctx.ui.notify(report.join("\n"), active.warnings.length > 0 ? "warning" : "info");
 		},
 	});
+}
+
+/**
+ * What to say about the capture directory in /tin.
+ *
+ * Whether it exists is the useful part: tin never removes a capture file, on the
+ * grounds that a path handed out two days ago should still work, so this is also
+ * where to look when you want the disk back. Nothing to say if the session has
+ * not captured anything, which is most of them.
+ */
+function captureState(dir: string): string {
+	try {
+		const names = readdirSync(dir);
+		return `${dir} (${names.length} file${names.length === 1 ? "" : "s"}; tin never removes them)`;
+	} catch {
+		return `${dir} (nothing captured yet)`;
+	}
 }
 
 export type { TinPolicy };

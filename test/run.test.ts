@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 import {
@@ -8,11 +8,14 @@ import {
 	execCommand,
 	formatOutcome,
 	listCommands,
+	nextCapturePath,
 	quoteForCmd,
+	resetCaptureSequence,
 	resolveCommand,
 	resolveWorkingDirectory,
 	TinDenied,
 } from "../src/run.ts";
+import { checkWritePath } from "../src/policy.ts";
 import { dataFile, fixture, link, script } from "./helpers.ts";
 
 const ECHO = ["/bin/echo", "/usr/bin/echo"].find((candidate) => existsSync(candidate));
@@ -324,4 +327,129 @@ test("a grandchild left holding the pipes does not hold up the call", async () =
 	assert.equal(outcome.timedOut, false);
 	assert.equal(outcome.stdout.trim(), "started");
 	assert.ok(outcome.durationMs < 5_000, `took ${outcome.durationMs}ms`);
+});
+
+// --------------------------------------------------------------------- capture
+
+test("capture writes stdout to a file and keeps it out of the result", async () => {
+	const fx = fixture();
+	// 500 lines is well past what the result will quote back.
+	script(fx, "many", "#!/bin/sh\ni=1\nwhile [ $i -le 500 ]; do echo \"line $i\"; i=$((i+1)); done\n");
+	resetCaptureSequence();
+
+	const target = nextCapturePath(fx.policy, "many");
+	const outcome = await execCommand(resolveCommand("many", fx.policy), [], {
+		cwd: fx.workspace,
+		env: buildChildEnv(fx.policy),
+		policy: fx.policy,
+		capturePath: target,
+	});
+
+	assert.equal(outcome.exitCode, 0);
+	assert.equal(outcome.capture?.path, target);
+	assert.equal(outcome.capture?.lines, 500);
+	assert.equal(statSync(target).size, outcome.capture?.bytes);
+	assert.equal(readFileSync(target, "utf8").split("\n").filter(Boolean).length, 500);
+
+	// The whole point: the model is told where it is, not handed all of it.
+	const text = formatOutcome("many", [], outcome);
+	assert.match(text, new RegExp(`stdout was captured to ${target}`));
+	assert.match(text, /first 30 lines:/);
+	assert.ok(text.includes("line 30"));
+	assert.ok(!text.includes("line 31"), "the preview should stop at 30 lines");
+});
+
+test("the capture directory is made on first use, with the run numbered", () => {
+	const fx = fixture();
+	resetCaptureSequence();
+	assert.equal(existsSync(fx.captureDir), false, "nothing should exist before a capture");
+
+	const first = nextCapturePath(fx.policy, "rg");
+	const second = nextCapturePath(fx.policy, "git");
+	assert.equal(first, path.join(fx.captureDir, "1-rg.out"));
+	assert.equal(second, path.join(fx.captureDir, "2-git.out"));
+	assert.equal(existsSync(fx.captureDir), true);
+	// Nobody else's business: the directory holds this user's command output.
+	if (process.platform !== "win32") {
+		assert.equal(statSync(fx.captureDir).mode & 0o777, 0o700);
+	}
+});
+
+test("the capture directory is never writable, whatever the write roots say", () => {
+	const fx = fixture({ writeRoots: ["~"] });
+	const decision = checkWritePath(path.join(fx.policy.captureDir, "1-rg.out"), fx.policy, fx.workspace);
+	assert.equal(decision.allow, false);
+	assert.match(decision.allow === false ? decision.reason : "", /never writable/);
+});
+
+test("a capture file stops at maxCaptureBytes and says so", async () => {
+	const fx = fixture({ exec: { maxCaptureBytes: 64 } });
+	script(fx, "many", "#!/bin/sh\ni=1\nwhile [ $i -le 500 ]; do echo \"line $i\"; i=$((i+1)); done\n");
+	resetCaptureSequence();
+
+	const target = nextCapturePath(fx.policy, "many");
+	const outcome = await execCommand(resolveCommand("many", fx.policy), [], {
+		cwd: fx.workspace,
+		env: buildChildEnv(fx.policy),
+		policy: fx.policy,
+		capturePath: target,
+	});
+
+	assert.equal(outcome.capture?.truncated, true);
+	assert.equal(outcome.capture?.bytes, 64);
+	assert.equal(statSync(target).size, 64);
+	assert.match(formatOutcome("many", [], outcome), /truncated at tin's capture ceiling/);
+});
+
+test("stderr stays out of the capture file and comes back in the result", async () => {
+	const fx = fixture();
+	script(fx, "noisy", "#!/bin/sh\necho payload\necho warning >&2\necho more-payload\n");
+	resetCaptureSequence();
+
+	const target = nextCapturePath(fx.policy, "noisy");
+	const outcome = await execCommand(resolveCommand("noisy", fx.policy), [], {
+		cwd: fx.workspace,
+		env: buildChildEnv(fx.policy),
+		policy: fx.policy,
+		capturePath: target,
+	});
+
+	// A warning interleaved into the data is what breaks whatever parses it next.
+	assert.equal(readFileSync(target, "utf8"), "payload\nmore-payload\n");
+	assert.match(formatOutcome("noisy", [], outcome), /stderr:\nwarning/);
+});
+
+test("the capture file is complete by the time the path is handed back", async () => {
+	const fx = fixture();
+	// Far more than a pipe buffer, so the write is still draining when the child exits.
+	script(fx, "gush", "#!/bin/sh\ni=1\nwhile [ $i -le 20000 ]; do echo \"0123456789012345678901234567890123456789 $i\"; i=$((i+1)); done\n");
+	resetCaptureSequence();
+
+	const target = nextCapturePath(fx.policy, "gush");
+	const outcome = await execCommand(resolveCommand("gush", fx.policy), [], {
+		cwd: fx.workspace,
+		env: buildChildEnv(fx.policy),
+		policy: fx.policy,
+		capturePath: target,
+	});
+
+	assert.equal(outcome.capture?.lines, 20000);
+	assert.equal(statSync(target).size, outcome.capture?.bytes);
+	assert.equal(readFileSync(target, "utf8").split("\n").filter(Boolean).length, 20000);
+});
+
+test("a run that captures nothing writes no file at all", async () => {
+	const fx = fixture();
+	assert.ok(ECHO);
+	link(fx, "echo", ECHO);
+
+	const outcome = await execCommand(resolveCommand("echo", fx.policy), ["hi"], {
+		cwd: fx.workspace,
+		env: buildChildEnv(fx.policy),
+		policy: fx.policy,
+	});
+
+	assert.equal(outcome.capture, undefined);
+	assert.equal(existsSync(fx.captureDir), false);
+	assert.match(formatOutcome("echo", ["hi"], outcome), /stdout:\nhi/);
 });

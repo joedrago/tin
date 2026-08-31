@@ -8,14 +8,14 @@
  * nothing in the engine proper reaches the machine without it. ECMAScript itself
  * has no I/O, so what is left after leaving it out is a language and no way down.
  *
- * On top of that this file adds six hooks and stops: write to stdout, write to
- * stderr, read a file as text, read a file as bytes, read stdin, and exit. There
- * is deliberately no counterpart that creates or modifies a file, opens a socket,
- * starts a process or reads the environment — and none can be reached by another
- * route, because there is no other route to reach. stdout is the only way data
- * leaves a tinjs run.
+ * On top of that this file adds a short, fixed list of hooks and stops: write to
+ * stdout, write to stderr, read a file as text, read a file as bytes, walk a file
+ * a line at a time, and exit. There is deliberately no counterpart that creates
+ * or modifies a file, opens a socket, starts a process or reads the environment —
+ * and none can be reached by another route, because there is no other route to
+ * reach. stdout is the only way data leaves a tinjs run.
  *
- * Everything friendlier than those six is in prelude.js, which the build turns
+ * Everything friendlier than those hooks is in prelude.js, which the build turns
  * into prelude.h and which runs before the user's script.
  */
 
@@ -217,20 +217,204 @@ static JSValue js_read_bytes(JSContext *ctx, JSValueConst this_val, int argc, JS
 	return out;
 }
 
-static JSValue js_read_stdin(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+/*
+ * An open file being read one line at a time.
+ *
+ * read() answers "give me this file"; a log too large to hold answers to nothing
+ * until there is a way to walk it, and this is that way. It is the only host
+ * object tinjs hands out, and it is deliberately opaque: no seek, no mode, no
+ * descriptor to recover, and nothing on it but "read one more line" and "close".
+ * The iterator a script actually sees is built around it in prelude.js.
+ *
+ * `chunk` is the raw window read from the file; `line` is the line being
+ * assembled out of one or more of those windows. Scanning the window with memchr
+ * rather than taking a byte at a time is what makes a million-line file a moment
+ * of work rather than a minute of it.
+ */
+#define TINJS_LINE_CHUNK ((size_t)64 << 10)
+#define TINJS_LINE_START ((size_t)4 << 10)
+
+typedef struct {
+	FILE *f; /* NULL once closed, which is also how end-of-file is remembered */
+	char *line;
+	size_t line_cap;
+	char *chunk;
+	size_t chunk_len; /* bytes in the window */
+	size_t chunk_pos; /* how far through the window we are */
+} LineReader;
+
+static JSClassID tinjs_line_reader_class_id;
+
+static void line_reader_close(LineReader *lr)
+{
+	if (lr->f) {
+		fclose(lr->f);
+		lr->f = NULL;
+	}
+}
+
+static void line_reader_finalizer(JSRuntime *rt, JSValueConst val)
+{
+	LineReader *lr = JS_GetOpaque(val, tinjs_line_reader_class_id);
+	if (!lr) return;
+	line_reader_close(lr);
+	js_free_rt(rt, lr->line);
+	js_free_rt(rt, lr->chunk);
+	js_free_rt(rt, lr);
+}
+
+static const JSClassDef tinjs_line_reader_class = {
+	.class_name = "LineReader",
+	.finalizer = line_reader_finalizer,
+};
+
+/*
+ * Make room for `need` bytes in the line being assembled.
+ *
+ * The ceiling is the one read() uses. A "line" that long is a file with no
+ * newlines in it, which is exactly the case read() already refuses, and the two
+ * should fail at the same place rather than at two numbers nobody can keep
+ * straight.
+ */
+static int line_reader_reserve(JSContext *ctx, LineReader *lr, size_t need, const char **err)
+{
+	if (need <= lr->line_cap) return 0;
+	if (need > TINJS_MAX_READ) {
+		*err = "line is too long to read";
+		return -1;
+	}
+	size_t cap = lr->line_cap;
+	while (cap < need) cap *= 2;
+	if (cap > TINJS_MAX_READ) cap = TINJS_MAX_READ;
+
+	char *grown = js_realloc(ctx, lr->line, cap);
+	if (!grown) {
+		*err = "out of memory";
+		return -1;
+	}
+	lr->line = grown;
+	lr->line_cap = cap;
+	return 0;
+}
+
+/* Read one line into lr->line, without its terminator. Returns 1 on a line, 0 at
+ * end of file, -1 on error with *err set. */
+static int line_reader_next(JSContext *ctx, LineReader *lr, size_t *out_len, const char **err)
+{
+	size_t len = 0;
+
+	if (!lr->f) return 0;
+
+	for (;;) {
+		if (lr->chunk_pos == lr->chunk_len) {
+			lr->chunk_len = fread(lr->chunk, 1, TINJS_LINE_CHUNK, lr->f);
+			lr->chunk_pos = 0;
+			if (lr->chunk_len == 0) {
+				if (ferror(lr->f)) {
+					*err = strerror(errno);
+					return -1;
+				}
+				/* A last line with no newline after it is still a line. */
+				line_reader_close(lr);
+				if (len == 0) return 0;
+				break;
+			}
+		}
+
+		char *from = lr->chunk + lr->chunk_pos;
+		size_t avail = lr->chunk_len - lr->chunk_pos;
+		char *nl = memchr(from, '\n', avail);
+		size_t take = nl ? (size_t)(nl - from) : avail;
+
+		if (take > 0) {
+			if (line_reader_reserve(ctx, lr, len + take, err) != 0) return -1;
+			memcpy(lr->line + len, from, take);
+			len += take;
+		}
+		lr->chunk_pos += nl ? take + 1 : take;
+
+		if (nl) break;
+	}
+
+	/* A file with CRLF endings reads the same as one with LF endings. */
+	if (len > 0 && lr->line[len - 1] == '\r') len--;
+	*out_len = len;
+	return 1;
+}
+
+static JSValue js_open_lines(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 {
 	(void)this_val;
-	(void)argc;
-	(void)argv;
+	if (argc < 1) return JS_ThrowTypeError(ctx, "lines() needs a path");
 
-	size_t len;
+	const char *path = JS_ToCString(ctx, argv[0]);
+	if (!path) return JS_EXCEPTION;
+
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		JS_ThrowInternalError(ctx, "cannot read %s: %s", path, strerror(errno));
+		JS_FreeCString(ctx, path);
+		return JS_EXCEPTION;
+	}
+	JS_FreeCString(ctx, path);
+
+	LineReader *lr = js_mallocz(ctx, sizeof(*lr));
+	if (!lr) {
+		fclose(f);
+		return JS_EXCEPTION;
+	}
+	lr->chunk = js_malloc(ctx, TINJS_LINE_CHUNK);
+	lr->line = js_malloc(ctx, TINJS_LINE_START);
+	if (!lr->chunk || !lr->line) {
+		fclose(f);
+		js_free(ctx, lr->chunk);
+		js_free(ctx, lr->line);
+		js_free(ctx, lr);
+		return JS_EXCEPTION;
+	}
+	lr->line_cap = TINJS_LINE_START;
+	lr->f = f;
+
+	JSValue obj = JS_NewObjectClass(ctx, tinjs_line_reader_class_id);
+	if (JS_IsException(obj)) {
+		fclose(f);
+		js_free(ctx, lr->chunk);
+		js_free(ctx, lr->line);
+		js_free(ctx, lr);
+		return obj;
+	}
+	JS_SetOpaque(obj, lr);
+	return obj;
+}
+
+static JSValue js_next_line(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+	(void)this_val;
+	if (argc < 1) return JS_ThrowTypeError(ctx, "nextLine() needs a reader");
+
+	LineReader *lr = JS_GetOpaque2(ctx, argv[0], tinjs_line_reader_class_id);
+	if (!lr) return JS_EXCEPTION;
+
+	size_t len = 0;
 	const char *err = NULL;
-	char *buf = slurp(stdin, &len, &err);
-	if (!buf) return JS_ThrowInternalError(ctx, "cannot read stdin: %s", err);
+	int r = line_reader_next(ctx, lr, &len, &err);
+	if (r < 0) {
+		line_reader_close(lr);
+		return JS_ThrowInternalError(ctx, "cannot read a line: %s", err);
+	}
+	if (r == 0) return JS_NULL;
+	return JS_NewStringLen(ctx, lr->line, len);
+}
 
-	JSValue out = JS_NewStringLen(ctx, buf, len);
-	free(buf);
-	return out;
+static JSValue js_close_lines(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+	(void)this_val;
+	if (argc < 1) return JS_UNDEFINED;
+
+	LineReader *lr = JS_GetOpaque2(ctx, argv[0], tinjs_line_reader_class_id);
+	if (!lr) return JS_EXCEPTION;
+	line_reader_close(lr);
+	return JS_UNDEFINED;
 }
 
 static JSValue js_exit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
@@ -269,8 +453,8 @@ static JSContext *new_context(JSRuntime *rt)
 	return ctx;
 }
 
-/* Install the six hooks as globalThis.__tin, where prelude.js picks them up and
- * then deletes the property. */
+/* Install the hooks as globalThis.__tin, where prelude.js picks them up and then
+ * deletes the property. */
 static int install_hooks(JSContext *ctx, int argc, char **argv)
 {
 	JSValue global = JS_GetGlobalObject(ctx);
@@ -282,7 +466,9 @@ static int install_hooks(JSContext *ctx, int argc, char **argv)
 	                  JS_NewCFunctionMagic(ctx, js_write, "writeErr", 1, JS_CFUNC_generic_magic, 1));
 	JS_SetPropertyStr(ctx, tin, "read", JS_NewCFunction(ctx, js_read, "read", 1));
 	JS_SetPropertyStr(ctx, tin, "readBytes", JS_NewCFunction(ctx, js_read_bytes, "readBytes", 1));
-	JS_SetPropertyStr(ctx, tin, "readStdin", JS_NewCFunction(ctx, js_read_stdin, "readStdin", 0));
+	JS_SetPropertyStr(ctx, tin, "openLines", JS_NewCFunction(ctx, js_open_lines, "openLines", 1));
+	JS_SetPropertyStr(ctx, tin, "nextLine", JS_NewCFunction(ctx, js_next_line, "nextLine", 1));
+	JS_SetPropertyStr(ctx, tin, "closeLines", JS_NewCFunction(ctx, js_close_lines, "closeLines", 1));
 	JS_SetPropertyStr(ctx, tin, "exit", JS_NewCFunction(ctx, js_exit, "exit", 1));
 
 	JSValue args = JS_NewArray(ctx);
@@ -398,7 +584,7 @@ static void usage(FILE *out)
 	        "in the script:\n"
 	        "  read(path)         file contents as a string\n"
 	        "  readBytes(path)    file contents as a Uint8Array\n"
-	        "  readStdin()        all of stdin as a string\n"
+	        "  lines(path)        iterate the file a line at a time\n"
 	        "  print(...)         a line on stdout; console.log is the same thing\n"
 	        "  console.error(...) a line on stderr\n"
 	        "  inspect(value)     the string print would have produced\n"
@@ -526,6 +712,14 @@ int main(int argc, char **argv)
 	JS_SetHostPromiseRejectionTracker(rt, on_promise_rejection, &rejection);
 	JS_SetMaxStackSize(rt, TINJS_STACK_BYTES);
 	if (memory_mb > 0) JS_SetMemoryLimit(rt, (size_t)memory_mb << 20);
+
+	JS_NewClassID(rt, &tinjs_line_reader_class_id);
+	if (JS_NewClass(rt, tinjs_line_reader_class_id, &tinjs_line_reader_class) < 0) {
+		fprintf(stderr, "tinjs: cannot start the interpreter\n");
+		JS_FreeRuntime(rt);
+		free(file_source);
+		return 1;
+	}
 
 	JSContext *ctx = new_context(rt);
 	if (!ctx) {
