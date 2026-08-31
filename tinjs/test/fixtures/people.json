@@ -1,0 +1,6 @@
+[
+  { "name": "ada",    "team": "core",  "commits": 412 },
+  { "name": "grace",  "team": "core",  "commits": 388 },
+  { "name": "alan",   "team": "infra", "commits": 91 },
+  { "name": "barbara","team": "infra", "commits": 205 }
+]

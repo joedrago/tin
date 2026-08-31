@@ -104,8 +104,6 @@ export interface BuildPolicyOptions {
 	home: string;
 	/** pi's agent config directory (~/.pi/agent), where tin.json lives. */
 	agentDir: string;
-	/** Directory holding tin's own source, which is never writable. */
-	selfDir?: string;
 	/**
 	 * Write roots for this session only, added to the configured ones rather than
 	 * replacing them. `bin/tin` puts the directories from its command line here, by
@@ -173,7 +171,6 @@ export function buildPolicy(options: BuildPolicyOptions): TinPolicy {
 		cwd,
 		home,
 		agentDir,
-		selfDir,
 		readFile = (p: string) => readFileSync(p, "utf8"),
 		isDirectory = defaultIsDirectory,
 	} = options;
@@ -236,10 +233,15 @@ export function buildPolicy(options: BuildPolicyOptions): TinPolicy {
 
 	const denySegments = stringArray(file.denySegments) ?? DEFAULT_DENY_SEGMENTS;
 
-	// Never writable, whatever the roots say: tin's own code, tin's own config, and
-	// the command allowlist. Each of these is a way to rewrite the policy itself.
+	// Never writable, whatever the roots say: tin's own config and the command
+	// allowlist. Both are ways to rewrite the policy rather than to work inside it,
+	// and neither is somewhere a session has a reason to be writing.
+	//
+	// tin's own source is deliberately not on this list. The write roots already say
+	// what may be written: if you are working somewhere else, this repository is not
+	// a root and is safe by not being one, and if you are working in it, editing it
+	// is the entire point of being there.
 	const denyPaths = [configPath, binDir];
-	if (selfDir) denyPaths.push(canonicalize(selfDir, cwd));
 
 	const exec: TinExecPolicy = {
 		timeoutMs: positiveNumber(file.exec?.timeoutMs, DEFAULT_EXEC.timeoutMs),

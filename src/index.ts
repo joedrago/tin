@@ -1,5 +1,4 @@
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import os from "node:os";
 import { Type } from "typebox";
@@ -8,6 +7,7 @@ import {
 	allowedToolNames,
 	decideToolCall,
 	describePolicy,
+	describeTinjs,
 	describeWriteRoots,
 	TIN_RUN,
 } from "./policy.ts";
@@ -20,8 +20,6 @@ import {
 	resolveWorkingDirectory,
 	TinDenied,
 } from "./run.ts";
-
-const selfDir = path.dirname(fileURLToPath(import.meta.url));
 
 /**
  * Write roots granted to one session, listed the way PATH is: a delimiter-separated
@@ -38,11 +36,6 @@ function extraWriteRootsFromEnv(): string[] {
 	const raw = process.env[EXTRA_ROOTS_ENV];
 	if (!raw) return [];
 	return raw.split(path.delimiter).filter((entry) => entry.trim() !== "");
-}
-
-/** tin's own source is never writable; cover both `src/index.ts` and a flat drop-in. */
-function selfPaths(): string {
-	return path.basename(selfDir) === "src" ? path.resolve(selfDir, "..") : selfDir;
 }
 
 const runSchema = Type.Object({
@@ -81,7 +74,6 @@ export default function tin(pi: ExtensionAPI) {
 				cwd: ctx.cwd,
 				home: os.homedir(),
 				agentDir: getAgentDir(),
-				selfDir: selfPaths(),
 				extraWriteRoots: extraWriteRootsFromEnv(),
 			});
 		}
@@ -171,6 +163,7 @@ export default function tin(pi: ExtensionAPI) {
 			commands.length > 0
 				? `- tin_run executes exactly these commands, with an argument array and no shell: ${commands.join(", ")}.`
 				: "- tin_run has no commands available, so nothing can be executed this session.",
+			...describeTinjs(commands),
 			"",
 			"Denials come back as tool errors explaining the rule. They are policy, not transient failures: do not retry the same call, and do not try to work around the restriction. If a task needs something outside these limits, say so and stop.",
 		];

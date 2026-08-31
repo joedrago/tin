@@ -95,6 +95,30 @@ export function decideToolCall(
 	);
 }
 
+/** The allowlist entry that is tinjs. Windows needs the extension to be runnable. */
+const TINJS_ENTRY = /^tinjs(\.exe)?$/i;
+
+/**
+ * What to tell the model about tinjs, when the user has linked it.
+ *
+ * These lines cost tokens in every session that has it, and they earn them back
+ * on the first use: a model that does not know tinjs is there reaches for bash
+ * and finds it gone, and a model that knows only its name reaches for
+ * require("fs") and spends a turn learning it is not that kind of interpreter.
+ * So the blurb states both halves — everything needed to write a working script
+ * on the first attempt, and everything that is pointless to attempt at all.
+ */
+export function describeTinjs(commands: string[]): string[] {
+	const name = commands.find((command) => TINJS_ENTRY.test(command));
+	if (!name) return [];
+	return [
+		`- \`${name}\` is a JavaScript interpreter, for the throwaway scripts that would otherwise want a shell: parsing, reshaping, aggregating and summarising data you have read. Call it as \`tin_run { command: "${name}", args: ["-e", "<code>"] }\`, or \`args: ["script.js", ...]\` for anything longer than a line or two.`,
+		`  - Standard JavaScript is all present — RegExp (named groups, lookbehind, unicode), JSON, Map, Set, typed arrays, Date, Math, BigInt, classes, generators, async/await.`,
+		`  - Added to it: \`read(path)\` and \`readBytes(path)\` for any path on this machine, \`readStdin()\`, \`print(...)\`, \`console.log/error\`, \`inspect(value)\`, \`args\` for the arguments after the script, and \`exit(code)\`.`,
+		`  - It cannot write a file, reach the network, run a program, read the environment, import a module or sleep — there is no API for any of it, so do not look for one. stdout is the only way a result comes back: print it, and use the write tool if it has to land on disk.`,
+	];
+}
+
 /** One-line summary of the policy, for the status line and /tin. */
 export function describePolicy(policy: TinPolicy): string {
 	const roots = policy.writeRoots.map((root) => path.basename(root)).join(", ") || "none";

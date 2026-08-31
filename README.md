@@ -97,6 +97,9 @@ arbitrary programs through `-exec`. `git` can run hooks and pagers. Prefer narro
 write a small wrapper script in `~/tinbin` that pins the subcommands you actually want —
 [`wrappers/`](wrappers) has a read-only `git` you can link instead of the real one.
 
+If what you wanted from `python` or `node` was a scratch script to chew on some data,
+[`tinjs`](#tinjs) is that without the general code execution.
+
 ## Writing a wrapper
 
 Linking a binary gives away everything that binary can do. Often what you actually want
@@ -168,14 +171,48 @@ into an exec:
   sets one does not get to use it. `--no-optional-locks` keeps a plain `status` from
   rewriting the index, so the read stays a read.
 
+## tinjs
+
+Models reach for a throwaway script constantly — parse this log, group those records,
+pull the versions out of that lockfile — and under tin there is nothing to reach for.
+A real interpreter would hand back general code execution, which is the one thing the
+allowlist exists to prevent.
+
+[`tinjs/`](tinjs) is the way out of that trade: a JavaScript interpreter built so that
+it cannot write. Standard ES2023 is all there — regular expressions with named groups
+and lookbehind, `JSON`, `Map`, `Set`, typed arrays, `Date`, `BigInt`, classes,
+`async`/`await` — plus `read`, `readBytes`, `readStdin`, `print`, `console`, `inspect`,
+`args` and `exit`. Nothing else. There is no function that creates a file, opens a
+socket, starts a process, reads the environment or loads a module, because the engine's
+host bindings are not compiled into the binary at all.
+
+```sh
+cmake -S tinjs -B tinjs/build && cmake --build tinjs/build
+ln -s ~/work/tin/tinjs/build/tinjs ~/tinbin/tinjs
+```
+
+```
+tin_run { command: "tinjs", args: ["-e", "print(JSON.parse(read('package.json')).version)"] }
+```
+
+Results come back on stdout and nowhere else, so a script prints what it worked out and
+tin's own write tool puts it on disk under the usual check. That is what makes tinjs
+safe to link when `node` is not: it is not trusted to respect the write roots, it is
+incapable of writing, whatever ends up in the script.
+
+tin recognises the name and tells the model what it is, so linking it is the whole
+setup. [`tinjs/README.md`](tinjs/README.md) has the rest — the limits, what the build
+leaves out and why, and how the vendored engine is updated.
+
 ## Windows
 
 The allowlist directory is `%USERPROFILE%\tinbin`, and everything above still holds, but
 what you can put in it is narrower:
 
-- **Link the file, extension and all.** `mklink /H %USERPROFILE%\tinbin\rg.exe C:\path\to\rg.exe`
-  needs no admin rights; a symlink does, unless Developer Mode is on. The name in the
-  directory is the name the model calls, so this one is `rg.exe`, not `rg`.
+- **Link the file, extension and all.** `mklink %USERPROFILE%\tinbin\rg.exe C:\path\to\rg.exe`
+  wants Developer Mode on or an elevated prompt; copying the file in works just as well
+  if neither is convenient. The name in the directory is the name the model calls, so
+  this one is `rg.exe`, not `rg`.
 - **An entry with no extension will not run.** Windows starts an image, not a shebang
   line, so a POSIX script named `git` is not something it can launch. Wrappers meant for
   Windows carry an extension, and the model calls them by it.
@@ -196,13 +233,17 @@ what you can put in it is narrower:
 So the read-only git looks like this, and the model calls it as `git.mjs`:
 
 ```bat
-mklink /H %USERPROFILE%\tinbin\git.mjs C:\work\tin\wrappers\git.mjs
+mklink %USERPROFILE%\tinbin\git.mjs C:\work\tin\wrappers\git.mjs
 ```
 
-A hard link shares its contents with the file it was made from, so linking a wrapper
-straight out of this repo means editing the repo edits the allowlisted command. That is
-usually what you want. It is safe here only because tin refuses writes to its own source
-tree; do not hard-link a wrapper you keep inside a write root.
+A link points at the file it was made from, so linking a wrapper straight out of this
+repo means editing the repo edits the allowlisted command. That is usually what you want.
+
+It is also safe, and for the ordinary reason rather than a special one. A session's write
+roots are the directory you pointed it at; this repository is not one of them and neither
+is the allowlist directory, so there is nothing a model under tin can do to reach either
+end of the link. It cannot edit the wrapper, and it cannot replace the entry pointing
+at it.
 
 ## Configuration
 
@@ -246,8 +287,12 @@ as configured roots are, so naming one that contains `binDir` disables execution
 
 The config is read from your home directory and never from the project, because the model
 can write in the project — a project-local policy file would be a policy the model edits.
-For the same reason, tin's own source directory, its config file, and `binDir` are never
-writable, whatever the write roots say.
+For the same reason the config file itself and `binDir` are never writable, whatever the
+write roots say: those two are how the policy gets rewritten rather than worked within.
+
+tin's own source is not on that list, and does not need to be. The write roots already
+answer the question: work anywhere else and this repository is not a root, so it is safe
+by not being one; work inside it and editing it is the whole reason you are there.
 
 ## What the child process gets
 
@@ -288,6 +333,11 @@ tin is a policy layer inside the pi process. It is not an OS sandbox, and pi's o
 - **There is a theoretical write race.** The path is canonicalized and checked, then pi's
   tool performs the write. Swapping a symlink in between would need the ability to create
   symlinks, which needs an allowed command that can.
+- **`tinjs` rests on the engine being sound.** It has no function that writes, so there is
+  no policy to get wrong — but it is an interpreter running attacker-chosen source, and a
+  memory-safety bug in quickjs would be a way out that no amount of curation upstream of it
+  would catch. That is a much higher bar than a forgotten `os.execute`, which is why the
+  batteries are the engine's rather than something linked in beside it, but it is not zero.
 
 For genuinely untrusted work, run the whole thing in a container or VM. tin is for the much
 more common case: a local model, your own machine, and a strong preference that it not touch
@@ -299,6 +349,14 @@ anything outside the directory you pointed it at.
 npm install
 npm test          # policy, path containment, and real subprocess behavior
 npm run typecheck # against pi's published types
+```
+
+tinjs is a separate C project with no dependencies of its own:
+
+```sh
+cmake -S tinjs -B tinjs/build
+cmake --build tinjs/build
+ctest --test-dir tinjs/build --output-on-failure
 ```
 
 The interesting logic is deliberately free of pi imports so it can be tested directly:

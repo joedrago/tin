@@ -41,7 +41,7 @@ export function fixture(config?: Record<string, unknown>): Fixture {
 	const configPath = path.join(agentDir, "tin.json");
 	if (config) writeFileSync(configPath, JSON.stringify(config));
 
-	const policy = buildPolicy({ cwd: workspace, home, agentDir, configPath, selfDir: undefined });
+	const policy = buildPolicy({ cwd: workspace, home, agentDir, configPath });
 	return { root, home, agentDir, workspace, binDir, outside, policy };
 }
 

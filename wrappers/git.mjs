@@ -6,7 +6,7 @@
 // Windows, where there is no shebang line and no POSIX shell to host the sh version.
 // Link it into your allowlist directory instead of git itself:
 //
-//     mklink /H %USERPROFILE%\tinbin\git.mjs C:\work\tin\wrappers\git.mjs   (Windows)
+//     mklink %USERPROFILE%\tinbin\git.mjs C:\work\tin\wrappers\git.mjs      (Windows)
 //     ln -s ~/work/tin/wrappers/git.mjs ~/tinbin/git.mjs                    (elsewhere)
 //
 // The model calls it by the name in the directory, so `git.mjs`. tin starts a .mjs
@@ -32,7 +32,7 @@
 // rule added to one of them is missing from the other until it is added there too.
 
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -340,8 +340,9 @@ function main(argv) {
 }
 
 // Run only when started as a program. Importing this file — the tests do — must not
-// launch git. process.argv[1] is the path tin spawned, which for a hard link is this
-// same file under its allowlist name, so the two URLs match either way.
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// launch git. argv[1] is the allowlist entry tin spawned, which is a link to this
+// file, so it is resolved before the comparison; import.meta.url already is.
+const entry = process.argv[1];
+if (entry && existsSync(entry) && import.meta.url === pathToFileURL(realpathSync(entry)).href) {
 	process.exitCode = main(process.argv.slice(2));
 }

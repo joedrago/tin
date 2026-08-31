@@ -3,7 +3,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { canonicalize, expandTilde, isInside } from "../src/paths.ts";
 import { buildPolicy } from "../src/config.ts";
-import { checkWritePath, decideToolCall, describeWriteRoots } from "../src/policy.ts";
+import { checkWritePath, decideToolCall, describeTinjs, describeWriteRoots } from "../src/policy.ts";
 import { fixture } from "./helpers.ts";
 
 function allowed(name: string, input: Record<string, unknown>, fx = fixture()) {
@@ -103,6 +103,22 @@ test("tin's own config and command directory are never writable", () => {
 	}
 });
 
+test("tin's own source is writable when it is where you are working", () => {
+	// tin used to protect its own directory unconditionally. It no longer does, and
+	// does not need to: the write roots already answer the question, and a session
+	// pointed at this repository is one that means to edit it.
+	const fx = fixture();
+	assert.deepEqual(fx.policy.denyPaths, [fx.policy.configPath, fx.binDir]);
+	assert.equal(checkWritePath(path.join(fx.workspace, "src", "policy.ts"), fx.policy, fx.workspace).allow, true);
+});
+
+test("a directory that is not a write root needs no special case to stay unwritable", () => {
+	const fx = fixture();
+	const decision = checkWritePath(path.join(fx.outside, "src", "policy.ts"), fx.policy, fx.workspace);
+	assert.equal(decision.allow, false);
+	assert.match(decision.allow === false ? decision.reason : "", /outside the writable roots/);
+});
+
 test("an empty path is denied rather than resolving to cwd", () => {
 	const fx = fixture();
 	assert.equal(allowed("write", {}, fx).allow, false);
@@ -126,4 +142,39 @@ test("the session banner marks the roots that are only there for this session", 
 test("the session banner says nothing is writable rather than listing an empty set", () => {
 	const fx = fixture({ writeRoots: [] });
 	assert.match(describeWriteRoots(fx.policy), /nothing is writable/);
+});
+
+test("the tinjs blurb appears only when tinjs is actually linked", () => {
+	assert.deepEqual(describeTinjs([]), []);
+	assert.deepEqual(describeTinjs(["git", "rg", "jq"]), []);
+	// A name that merely starts with tinjs is a different command.
+	assert.deepEqual(describeTinjs(["tinjs-old", "tinjsx"]), []);
+
+	const blurb = describeTinjs(["git", "tinjs"]).join("\n");
+	assert.match(blurb, /`tinjs` is a JavaScript interpreter/);
+});
+
+test("the tinjs blurb calls the command by the name it is linked under", () => {
+	// Windows entries carry the extension, and that is the name the model must use.
+	const blurb = describeTinjs(["rg.exe", "tinjs.exe"]).join("\n");
+	assert.match(blurb, /command: "tinjs\.exe"/);
+	assert.ok(!blurb.includes('command: "tinjs"'));
+});
+
+test("the tinjs blurb states what is not there, so the model does not go looking", () => {
+	const blurb = describeTinjs(["tinjs"]).join("\n");
+	for (const capability of ["write a file", "reach the network", "run a program", "read the environment", "import a module"]) {
+		assert.ok(blurb.includes(capability), `blurb should rule out: ${capability}`);
+	}
+	// And what it does have, since that is what saves the wasted first attempt.
+	for (const api of ["read(path)", "readBytes(path)", "readStdin()", "print(...)", "exit(code)"]) {
+		assert.ok(blurb.includes(api), `blurb should offer: ${api}`);
+	}
+});
+
+test("the tinjs blurb does not describe limits tinjs no longer imposes", () => {
+	// The memory and time caps are off by default; a model told about a 60s budget
+	// would size its work to a bound that is not there.
+	const blurb = describeTinjs(["tinjs"]).join("\n");
+	assert.doesNotMatch(blurb, /\b60s\b|\b256\s?MB\b|\bLimits are\b/i);
 });
