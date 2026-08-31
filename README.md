@@ -186,10 +186,8 @@ and lookbehind, `JSON`, `Map`, `Set`, typed arrays, `Date`, `BigInt`, classes,
 socket, starts a process, reads the environment or loads a module, because the engine's
 host bindings are not compiled into the binary at all.
 
-```sh
-cmake -S tinjs -B tinjs/build && cmake --build tinjs/build
-ln -s ~/work/tin/tinjs/build/tinjs ~/tinbin/tinjs
-```
+Building it and linking it into `tinbin` is [its own README](tinjs/README.md#building).
+Once it is there:
 
 ```
 tin_run { command: "tinjs", args: ["-e", "print(JSON.parse(read('package.json')).version)"] }
@@ -351,13 +349,8 @@ npm test          # policy, path containment, and real subprocess behavior
 npm run typecheck # against pi's published types
 ```
 
-tinjs is a separate C project with no dependencies of its own:
-
-```sh
-cmake -S tinjs -B tinjs/build
-cmake --build tinjs/build
-ctest --test-dir tinjs/build --output-on-failure
-```
+tinjs is a separate C project with no dependencies of its own; it builds and tests on
+its own terms, described in [`tinjs/README.md`](tinjs/README.md#building).
 
 The interesting logic is deliberately free of pi imports so it can be tested directly:
 `src/paths.ts` (canonicalization and containment), `src/policy.ts` (the gate),

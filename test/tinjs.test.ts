@@ -16,7 +16,7 @@ const binary = path.join(
 
 /**
  * tinjs is built separately and is not required to be present, so these skip
- * rather than fail when it has not been. `cmake --build tinjs/build` first.
+ * rather than fail when it has not been. See tinjs/README.md to build it.
  */
 const needsTinjs = { skip: existsSync(binary) ? false : "tinjs is not built" };
 
