@@ -104,9 +104,16 @@ tarball.
 
 ```sh
 cmake -S tinjs -B tinjs/build
-cmake --build tinjs/build
-ctest --test-dir tinjs/build --output-on-failure
+cmake --build tinjs/build --config Release
+ctest --test-dir tinjs/build -C Release --output-on-failure
 ```
+
+The `--config`/`-C` pair is what makes that Release everywhere. Single-config
+generators — Ninja, Makefiles — take the build type at configure time and this
+file already defaults them to Release, so they ignore both flags. Multi-config
+generators, which is what you get by default on Windows, decide per build
+instead: without `--config` they build Debug, and `ctest` will not run at all
+without a matching `-C` ("Test not available without configuration").
 
 That is a ~1 MB single-file binary with no runtime of its own to find. Then link
 it in like anything else:
@@ -116,10 +123,11 @@ ln -s ~/work/tin/tinjs/build/tinjs ~/tinbin/tinjs
 ```
 
 On Windows the entry needs its extension, because that is the name the model
-calls:
+calls, and the multi-config generator puts the binary in a subdirectory named
+for the configuration:
 
 ```bat
-mklink %USERPROFILE%\tinbin\tinjs.exe C:\work\tin\tinjs\build\tinjs.exe
+mklink %USERPROFILE%\tinbin\tinjs.exe C:\work\tin\tinjs\build\Release\tinjs.exe
 ```
 
 tin notices it by name and tells the model what it is, so there is nothing to
