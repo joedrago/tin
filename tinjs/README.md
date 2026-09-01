@@ -163,7 +163,7 @@ That is a ~1 MB single-file binary with no runtime of its own to find. Then link
 it in like anything else:
 
 ```sh
-ln -s ~/work/tin/tinjs/build/tinjs ~/tinbin/tinjs
+ln -s /path/to/tin/tinjs/build/tinjs ~/tinbin/tinjs
 ```
 
 On Windows the entry needs its extension, because that is the name the model

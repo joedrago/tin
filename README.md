@@ -23,18 +23,33 @@ model never names the destination, so this stays true — there is no `>` to poi
 
 ## Install
 
-tin belongs to you, not to a project, so install it globally:
-
 ```sh
-git clone <this repo> ~/work/tin
-ln -s ~/work/tin/src ~/.pi/agent/extensions/tin
-```
+# -------------------------------------------------------------------------
+# Required stuff
 
-That makes it a global extension, active in every pi session and reloadable with `/reload`.
-To try it on one session first:
+# Choose your own value of TIN_ROOT here!
+export TIN_ROOT=/path/to/tin
 
-```sh
-pi -e ~/work/tin/src/index.ts
+# Clone + basic functionality
+git clone https://github.com/joedrago/tin.git ${TIN_ROOT}
+ln -s ${TIN_ROOT}/src ~/.pi/agent/extensions/tin
+
+# -------------------------------------------------------------------------
+# Optional stuff
+
+# "tin" frontend wrapper for pi for adding more RW roots
+ln -s ${TIN_ROOT}/bin/tin ~/bin/tin
+
+# grant access to jq, readonly wrappers for git/rg
+mkdir -p ~/tinbin
+ln -s ${TIN_ROOT}/wrappers/rg  ~/tinbin/rg    # not the real rg; see below
+ln -s ${TIN_ROOT}/wrappers/git ~/tinbin/git   # nor the real git
+ln -s "$(command -v jq)"       ~/tinbin/jq
+
+# tinjs (safe Javascript support)
+cmake -S ${TIN_ROOT}/tinjs -B ${TIN_ROOT}/tinjs/build
+cmake --build ${TIN_ROOT}/tinjs/build --config Release
+ln -s ${TIN_ROOT}/tinjs/build/tinjs ~/tinbin/tinjs
 ```
 
 ## Extra write roots for one session
@@ -44,7 +59,7 @@ genuinely spans two of them. `bin/tin` starts pi with the directories you name a
 the write roots for that session and no longer:
 
 ```sh
-ln -s ~/work/tin/bin/tin ~/bin/tin
+ln -s /path/to/tin/bin/tin ~/bin/tin
 
 tin                     # exactly a plain pi: the working directory and nothing else
 tin ../shared ~/notes   # those two as well, until you close the session
@@ -76,8 +91,8 @@ Create the directory and link in exactly what you are willing to let the model r
 
 ```sh
 mkdir -p ~/tinbin
-ln -s ~/work/tin/wrappers/rg  ~/tinbin/rg    # not the real rg; see below
-ln -s ~/work/tin/wrappers/git ~/tinbin/git   # nor the real git
+ln -s /path/to/tin/wrappers/rg  ~/tinbin/rg    # not the real rg; see below
+ln -s /path/to/tin/wrappers/git ~/tinbin/git   # nor the real git
 ln -s "$(command -v jq)"      ~/tinbin/jq
 ```
 
@@ -145,7 +160,7 @@ write one:
 until you link one in — tin never looks at that directory itself, only at `binDir`:
 
 ```sh
-ln -s ~/work/tin/wrappers/git ~/tinbin/git
+ln -s /path/to/tin/wrappers/git ~/tinbin/git
 ```
 
 They are POSIX shell scripts with no dependencies beyond the tool they wrap, written to
