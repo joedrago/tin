@@ -9,11 +9,12 @@
  * has no I/O, so what is left after leaving it out is a language and no way down.
  *
  * On top of that this file adds a short, fixed list of hooks and stops: write to
- * stdout, write to stderr, read a file as text, read a file as bytes, walk a file
- * a line at a time, and exit. There is deliberately no counterpart that creates
- * or modifies a file, opens a socket, starts a process or reads the environment —
- * and none can be reached by another route, because there is no other route to
- * reach. stdout is the only way data leaves a tinjs run.
+ * stdout, write to stderr, read a file as text, read a file as bytes (whole or a
+ * slice by offset and length), stat a path, walk a file a line at a time, and
+ * exit. There is deliberately no counterpart that creates or modifies a file,
+ * opens a socket, starts a process or reads the environment — and none can be
+ * reached by another route, because there is no other route to reach. stdout is
+ * the only way data leaves a tinjs run.
  *
  * Everything friendlier than those hooks is in prelude.js, which the build turns
  * into prelude.h and which runs before the user's script.
@@ -25,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "quickjs.h"
 
@@ -35,6 +37,15 @@
 #else
 #	include <time.h>
 #	include <unistd.h>
+#endif
+
+/* MSVC's <sys/stat.h> has no S_ISDIR/S_ISREG; MinGW's already does, so this is
+ * only filled in where it is actually missing. */
+#ifndef S_ISDIR
+#	define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+#ifndef S_ISREG
+#	define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
 #endif
 
 #include "prelude.h"
@@ -203,17 +214,121 @@ static JSValue js_read(JSContext *ctx, JSValueConst this_val, int argc, JSValueC
 	return out;
 }
 
+/*
+ * readBytes(path) reads the whole file, same as before. readBytes(path, offset)
+ * reads from offset to the end, and readBytes(path, offset, length) reads at
+ * most length bytes from there — short of length at EOF is not an error, the
+ * same way a short fread() is not one. This is the point of the offset form:
+ * pulling one header or one record out of a file too large to slurp does not
+ * have to pay for the rest of it.
+ */
 static JSValue js_read_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 {
 	(void)this_val;
 	if (argc < 1) return JS_ThrowTypeError(ctx, "readBytes() needs a path");
 
-	size_t len;
-	char *buf = slurp_path(ctx, argv[0], &len);
-	if (!buf) return JS_EXCEPTION;
+	bool has_offset = argc >= 2 && !JS_IsUndefined(argv[1]);
+	bool has_length = argc >= 3 && !JS_IsUndefined(argv[2]);
 
+	int64_t offset = 0, length = 0;
+	if (has_offset) {
+		if (JS_ToInt64(ctx, &offset, argv[1])) return JS_EXCEPTION;
+		if (offset < 0) return JS_ThrowRangeError(ctx, "readBytes() offset must not be negative");
+	}
+	if (has_length) {
+		if (JS_ToInt64(ctx, &length, argv[2])) return JS_EXCEPTION;
+		if (length < 0) return JS_ThrowRangeError(ctx, "readBytes() length must not be negative");
+		if ((uint64_t)length > TINJS_MAX_READ)
+			return JS_ThrowInternalError(ctx, "readBytes() length is too large to read");
+	}
+
+	const char *path = JS_ToCString(ctx, argv[0]);
+	if (!path) return JS_EXCEPTION;
+
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		JS_ThrowInternalError(ctx, "cannot read %s: %s", path, strerror(errno));
+		JS_FreeCString(ctx, path);
+		return JS_EXCEPTION;
+	}
+
+	if (has_offset) {
+#ifdef _WIN32
+		int seek_r = _fseeki64(f, offset, SEEK_SET);
+#else
+		int seek_r = fseeko(f, (off_t)offset, SEEK_SET);
+#endif
+		if (seek_r != 0) {
+			JS_ThrowInternalError(ctx, "cannot read %s: %s", path, strerror(errno));
+			JS_FreeCString(ctx, path);
+			fclose(f);
+			return JS_EXCEPTION;
+		}
+	}
+
+	char *buf;
+	size_t len;
+	const char *err = NULL;
+
+	if (has_length) {
+		buf = malloc((size_t)length > 0 ? (size_t)length : 1);
+		if (!buf) {
+			err = "out of memory";
+			len = 0;
+		} else {
+			len = fread(buf, 1, (size_t)length, f);
+			if (len < (size_t)length && ferror(f)) err = strerror(errno);
+		}
+	} else {
+		buf = slurp(f, &len, &err);
+	}
+	fclose(f);
+
+	if (err) {
+		JS_ThrowInternalError(ctx, "cannot read %s: %s", path, err);
+		JS_FreeCString(ctx, path);
+		free(buf);
+		return JS_EXCEPTION;
+	}
+
+	JS_FreeCString(ctx, path);
 	JSValue out = JS_NewUint8ArrayCopy(ctx, (const uint8_t *)buf, len);
 	free(buf);
+	return out;
+}
+
+/* size, modtime, and what kind of thing a path is — the three questions a
+ * script needs answered before it decides how (or whether) to read something,
+ * without having to attempt the read first to find out. */
+#ifdef _WIN32
+typedef struct __stat64 tinjs_stat_t;
+#	define tinjs_stat _stat64
+#else
+typedef struct stat tinjs_stat_t;
+#	define tinjs_stat stat
+#endif
+
+static JSValue js_stat(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+	(void)this_val;
+	if (argc < 1) return JS_ThrowTypeError(ctx, "stat() needs a path");
+
+	const char *path = JS_ToCString(ctx, argv[0]);
+	if (!path) return JS_EXCEPTION;
+
+	tinjs_stat_t st;
+	if (tinjs_stat(path, &st) != 0) {
+		JS_ThrowInternalError(ctx, "cannot stat %s: %s", path, strerror(errno));
+		JS_FreeCString(ctx, path);
+		return JS_EXCEPTION;
+	}
+	JS_FreeCString(ctx, path);
+
+	JSValue out = JS_NewObject(ctx);
+	JS_SetPropertyStr(ctx, out, "size", JS_NewInt64(ctx, (int64_t)st.st_size));
+	JS_SetPropertyStr(ctx, out, "mtimeMs", JS_NewFloat64(ctx, (double)st.st_mtime * 1000.0));
+	JS_SetPropertyStr(ctx, out, "isDirectory", JS_NewBool(ctx, S_ISDIR(st.st_mode)));
+	JS_SetPropertyStr(ctx, out, "isFile", JS_NewBool(ctx, S_ISREG(st.st_mode)));
 	return out;
 }
 
@@ -465,7 +580,8 @@ static int install_hooks(JSContext *ctx, int argc, char **argv)
 	JS_SetPropertyStr(ctx, tin, "writeErr",
 	                  JS_NewCFunctionMagic(ctx, js_write, "writeErr", 1, JS_CFUNC_generic_magic, 1));
 	JS_SetPropertyStr(ctx, tin, "read", JS_NewCFunction(ctx, js_read, "read", 1));
-	JS_SetPropertyStr(ctx, tin, "readBytes", JS_NewCFunction(ctx, js_read_bytes, "readBytes", 1));
+	JS_SetPropertyStr(ctx, tin, "readBytes", JS_NewCFunction(ctx, js_read_bytes, "readBytes", 3));
+	JS_SetPropertyStr(ctx, tin, "stat", JS_NewCFunction(ctx, js_stat, "stat", 1));
 	JS_SetPropertyStr(ctx, tin, "openLines", JS_NewCFunction(ctx, js_open_lines, "openLines", 1));
 	JS_SetPropertyStr(ctx, tin, "nextLine", JS_NewCFunction(ctx, js_next_line, "nextLine", 1));
 	JS_SetPropertyStr(ctx, tin, "closeLines", JS_NewCFunction(ctx, js_close_lines, "closeLines", 1));
@@ -584,6 +700,9 @@ static void usage(FILE *out)
 	        "in the script:\n"
 	        "  read(path)         file contents as a string\n"
 	        "  readBytes(path)    file contents as a Uint8Array\n"
+	        "  readBytes(path, offset, length)\n"
+	        "                     length bytes starting at offset, not the whole file\n"
+	        "  stat(path)         { size, mtime, isDirectory, isFile }\n"
 	        "  lines(path)        iterate the file a line at a time\n"
 	        "  print(...)         a line on stdout; console.log is the same thing\n"
 	        "  console.error(...) a line on stderr\n"

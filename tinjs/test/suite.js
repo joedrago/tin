@@ -145,6 +145,26 @@ eq("readBytes handles NUL and 0xff", Array.from(bytes.slice(6)), [0x00, 0x01, 0x
 eq("read decodes utf8", read(`${fixtures}/bytes.bin`).slice(0, 4), "café");
 throws("read of a missing file throws", () => read(`${fixtures}/nope-does-not-exist`));
 
+// readBytes(path, offset, length): a slice, without reading the rest of the file.
+eq("readBytes slice", Array.from(readBytes(`${fixtures}/bytes.bin`, 6, 4)), [0x00, 0x01, 0x02, 0xff]);
+eq("readBytes offset with no length reads to EOF", Array.from(readBytes(`${fixtures}/bytes.bin`, 8)), [0x02, 0xff]);
+eq("readBytes offset 0 matches the whole-file form", Array.from(readBytes(`${fixtures}/bytes.bin`, 0)), Array.from(bytes));
+eq("readBytes length past EOF is short, not an error", Array.from(readBytes(`${fixtures}/bytes.bin`, 8, 100)), [0x02, 0xff]);
+eq("readBytes offset past EOF is empty, not an error", Array.from(readBytes(`${fixtures}/bytes.bin`, 1000, 10)), []);
+throws("readBytes negative offset throws", () => readBytes(`${fixtures}/bytes.bin`, -1));
+throws("readBytes negative length throws", () => readBytes(`${fixtures}/bytes.bin`, 0, -1));
+throws("readBytes of a missing file throws", () => readBytes(`${fixtures}/nope-does-not-exist`, 0, 1));
+
+// stat(): the questions worth asking before deciding how (or whether) to read.
+const fileStat = stat(`${fixtures}/bytes.bin`);
+eq("stat size", fileStat.size, 10);
+ok("stat mtime is a Date", fileStat.mtime instanceof Date);
+ok("stat mtime is not garbage", !Number.isNaN(fileStat.mtime.getTime()) && fileStat.mtime.getTime() > 0);
+eq("stat isFile on a file", [fileStat.isFile, fileStat.isDirectory], [true, false]);
+const dirStat = stat(fixtures);
+eq("stat isDirectory on a directory", [dirStat.isFile, dirStat.isDirectory], [false, true]);
+throws("stat of a missing path throws", () => stat(`${fixtures}/nope-does-not-exist`));
+
 // lines(): the same reads, one line at a time, for files too big to hold. The
 // whole point is that nothing here accumulates, so what is checked is the
 // boundaries — terminators, a last line without one, and blank lines in between.

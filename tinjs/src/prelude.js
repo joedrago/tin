@@ -175,6 +175,22 @@
 	globalThis.read = raw.read;
 	globalThis.readBytes = raw.readBytes;
 
+	/**
+	 * Answer size, modtime and kind for a path without reading it — the thing to
+	 * call before deciding whether a `read`, a `readBytes` slice, or nothing at
+	 * all is the right next move on a file that might be huge or might not even
+	 * be a file.
+	 */
+	globalThis.stat = function stat(path) {
+		const raw_stat = raw.stat(path);
+		return {
+			size: raw_stat.size,
+			mtime: new Date(raw_stat.mtimeMs),
+			isDirectory: raw_stat.isDirectory,
+			isFile: raw_stat.isFile,
+		};
+	};
+
 	globalThis.exit = raw.exit;
 	globalThis.args = raw.args;
 })();

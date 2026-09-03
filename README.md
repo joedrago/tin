@@ -24,33 +24,51 @@ model never names the destination, so this stays true — there is no `>` to poi
 ## Install
 
 ```sh
-# -------------------------------------------------------------------------
-# Required stuff
-
-# Choose your own value of TIN_ROOT here!
-export TIN_ROOT=/path/to/tin
-
-# Clone + basic functionality
-git clone https://github.com/joedrago/tin.git ${TIN_ROOT}
-ln -s ${TIN_ROOT}/src ~/.pi/agent/extensions/tin
-
-# -------------------------------------------------------------------------
-# Optional stuff
-
-# "tin" frontend wrapper for pi for adding more RW roots
-ln -s ${TIN_ROOT}/bin/tin ~/bin/tin
-
-# grant access to jq, readonly wrappers for git/rg
-mkdir -p ~/tinbin
-ln -s ${TIN_ROOT}/wrappers/rg  ~/tinbin/rg    # not the real rg; see below
-ln -s ${TIN_ROOT}/wrappers/git ~/tinbin/git   # nor the real git
-ln -s "$(command -v jq)"       ~/tinbin/jq
-
-# tinjs (safe Javascript support)
-cmake -S ${TIN_ROOT}/tinjs -B ${TIN_ROOT}/tinjs/build
-cmake --build ${TIN_ROOT}/tinjs/build --config Release
-ln -s ${TIN_ROOT}/tinjs/build/tinjs ~/tinbin/tinjs
+git clone https://github.com/joedrago/tin.git
+cd tin
+npm install
+npm run setup
 ```
+
+`npm run setup` is `tin --setup`, which is the block of `ln -s` and `cmake` commands
+this used to ask you to copy by hand: it links [the extension](#tinjs) into
+`~/.pi/agent/extensions`, creates `~/tinbin`, links in the [read-only `git` and `rg`
+wrappers](#ready-made-wrappers) and the [genuinely inert commands](#allowing-commands)
+that are actually on your machine, and builds and links [`tinjs`](#tinjs). It never
+asks anything, and it prints what it did:
+
+```
+tin --setup
+  • linked the pi extension
+  • ~/tinbin ready at /home/you/tinbin
+  • linked git (read-only git)
+  • linked rg (read-only rg)
+  • linked jq
+  • grep: not on PATH, skipped
+  ...
+  • tinjs build configured
+  • tinjs built
+  • linked tinjs
+
+Done!
+```
+
+It never overwrites something already at a link path that it did not create either
+— run it again after installing a tool you did not have yet, or after pulling an
+update that changed a wrapper, and it links only what is new.
+
+That's the whole extension: pi picks it up on its next launch, and you can point it
+at any directory as usual. The one more piece worth having is `tin` itself, the
+frontend below that starts pi with [extra write roots](#extra-write-roots-for-one-session)
+for a session — symlink it onto your `PATH` if you want it:
+
+```sh
+ln -s "$(pwd)/bin/tin" ~/bin/tin
+```
+
+Nothing here is required, though: every piece `--setup` automates is also just a
+symlink or a `cmake` invocation, described in its own section below for doing by
+hand or doing differently.
 
 ## Extra write roots for one session
 
@@ -234,10 +252,11 @@ allowlist exists to prevent.
 [`tinjs/`](tinjs) is the way out of that trade: a JavaScript interpreter built so that
 it cannot write. Standard ES2023 is all there — regular expressions with named groups
 and lookbehind, `JSON`, `Map`, `Set`, typed arrays, `Date`, `BigInt`, classes,
-`async`/`await` — plus `read`, `readBytes`, `lines`, `print`, `console`, `inspect`,
-`args` and `exit`. Nothing else. There is no function that creates a file, opens a
-socket, starts a process, reads the environment or loads a module, because the engine's
-host bindings are not compiled into the binary at all.
+`async`/`await` — plus `read`, `readBytes` (whole file or a byte slice by offset and
+length), `stat`, `lines`, `print`, `console`, `inspect`, `args` and `exit`. Nothing
+else. There is no function that creates a file, opens a socket, starts a process,
+reads the environment or loads a module, because the engine's host bindings are not
+compiled into the binary at all.
 
 Building it and linking it into `tinbin` is [its own README](tinjs/README.md#building).
 Once it is there:

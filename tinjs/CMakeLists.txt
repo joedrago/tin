@@ -99,6 +99,10 @@ target_include_directories(tinjs PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(tinjs PRIVATE quickjs)
 if(WIN32)
     target_compile_definitions(tinjs PRIVATE WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0601)
+else()
+    # readBytes()'s offset seeks with fseeko(); without this, off_t is 32 bits on
+    # a 32-bit build and a seek past 2GB silently wraps.
+    target_compile_definitions(tinjs PRIVATE _FILE_OFFSET_BITS=64)
 endif()
 
 install(TARGETS tinjs RUNTIME DESTINATION bin)

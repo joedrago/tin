@@ -11,6 +11,7 @@
 		"extensions": ["./src/index.ts"]
 	},
 	"scripts": {
+		"setup": "node ./bin/tin --setup",
 		"test": "node --test test/*.test.ts",
 		"typecheck": "tsc --noEmit"
 	},

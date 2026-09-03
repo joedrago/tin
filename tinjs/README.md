@@ -26,18 +26,51 @@ expressions with named groups, lookbehind and unicode property escapes; `JSON`;
 fields; generators; destructuring; `async`/`await`; `atob`/`btoa`. Every global is
 either ECMAScript or one of the ones below.
 
-    read(path)         file contents as a string
-    readBytes(path)    file contents as a Uint8Array
-    lines(path)        the file one line at a time, without holding it
-    print(...)         a line on stdout
-    console.log/error  the same, and its stderr counterpart
-    inspect(value)     the string print would have produced
-    args               the arguments after the script
-    exit(code)         stop now
+    read(path)                       file contents as a string
+    readBytes(path)                  file contents as a Uint8Array
+    readBytes(path, offset, length)  length bytes starting at offset
+    stat(path)                       { size, mtime, isDirectory, isFile }
+    lines(path)                      the file one line at a time, without holding it
+    print(...)                       a line on stdout
+    console.log/error                the same, and its stderr counterpart
+    inspect(value)                   the string print would have produced
+    args                             the arguments after the script
+    exit(code)                       stop now
 
 Reads are unrestricted, the same as everywhere else in tin: it is all your own
 machine. `read` decodes UTF-8; `readBytes` returns a copy of the bytes, so writing
 into the array it hands back changes nothing on disk.
+
+### Slicing a file that does not fit, and knowing what you are looking at first
+
+`readBytes(path)` is `read`'s problem too — the whole file, in memory — which
+matters most for exactly the files it is for: binary formats, where `read`'s
+UTF-8 decoding would corrupt the bytes anyway. `readBytes(path, offset, length)`
+is the way around it, a slice with no need to hold what surrounds it:
+
+```js
+const magic = readBytes("archive.tar", 257, 8); // ustar\0 at the header's usual spot
+```
+
+`offset` alone reads from there to the end of the file; both omitted is the
+whole-file form from before. Asking past the end of the file is not an error —
+a short or empty result is what you get, the same as a short `fread()` — but a
+negative `offset` or `length` throws, since neither one is a real position.
+
+`stat(path)` answers the questions worth asking before any of that: how big
+the file is, when it last changed, and whether it is a file at all rather than
+a directory you just handed to `read`.
+
+```js
+const info = stat("access.log");
+if (info.isFile && info.size > 100 << 20) {
+    // too big to read() — walk it with lines() instead
+}
+```
+
+`size` is bytes, `mtime` is a `Date`, and `isDirectory`/`isFile` are exactly one
+of them `true` for anything `stat` can see at all — it throws instead for a path
+that does not exist, the same as `read` does.
 
 ### Walking a file that does not fit
 
@@ -187,7 +220,7 @@ a script cannot see from inside itself: exit codes, the limits, and stderr.
 ## Layout
 
     CMakeLists.txt     builds the engine and one executable, and nothing else
-    src/tinjs.c        the six hooks, the limits, and the argument handling
+    src/tinjs.c        the seven hooks, the limits, and the argument handling
     src/prelude.js     console, inspect and the friendly names, in JavaScript
     quickjs/           vendored engine, minus its host bindings
     test/              the two suites and their fixtures

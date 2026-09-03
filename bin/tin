@@ -2,6 +2,7 @@
 // tin — start pi with a temporary set of extra write roots.
 //
 //     tin [-r] [DIR [DIR...]]
+//     tin --setup
 //
 // Order does not matter. Plain `tin` is plain `pi`: the working directory is the
 // only place the model may write, exactly as the extension behaves on its own.
@@ -9,13 +10,16 @@
 // handed over in TIN_EXTRA_WRITE_ROOTS, and tin prints the roots it ended up with
 // when the session opens. `-r` (resume a session) is passed through to pi.
 //
-// Symlink this anywhere on your PATH; it locates nothing relative to itself, so a
-// link out of the repo works with no further setup.
+// Symlink this anywhere on your PATH; it locates nothing relative to itself for
+// any of the above, so a link out of the repo works with no further setup. The
+// one exception is `--setup`, which has to find src/, wrappers/ and tinjs/ to
+// link them, and does that by resolving its own symlink back to this file first.
 
-import { spawn } from "node:child_process";
-import { statSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** Matches expandTilde in src/paths.ts, for the argument your shell did not expand. */
 function expandTilde(input) {
@@ -28,14 +32,37 @@ function expandTilde(input) {
 const EXTRA_ROOTS_ENV = "TIN_EXTRA_WRITE_ROOTS";
 
 const USAGE = `usage: tin [-r] [DIR [DIR...]]
+       tin --setup
 
-  DIR  a directory the model may also write in, for this session only
-  -r   passed through to pi: pick a session to resume
+  DIR      a directory the model may also write in, for this session only
+  -r       passed through to pi: pick a session to resume
+  --setup  link the pi extension, create ~/tinbin, link the wrappers and inert
+           commands that are on your PATH, and build and link tinjs
 `;
 
 function fail(message) {
 	process.stderr.write(`tin: ${message}\n`);
 	process.exit(2);
+}
+
+/**
+ * Read-only commands with no flag that writes a file, runs a program, or
+ * reaches the network — see the "Ready-made wrappers" and "Genuinely inert"
+ * sections of README.md for the reasoning behind each one. Linked directly,
+ * with no wrapper needed.
+ */
+const INERT_COMMANDS = [
+	"jq", "grep", "wc", "cut", "tr", "uniq", "comm", "diff",
+	"strings", "xxd", "base64", "head", "tail", "file", "stat",
+];
+
+/** Commands where the real thing is too dangerous to link directly, and a
+ * read-only policy wrapper in wrappers/ stands in for it instead. */
+const WRAPPED_COMMANDS = ["git", "rg"];
+
+if (process.argv.slice(2).includes("--setup")) {
+	runSetup();
+	process.exit(0);
 }
 
 const dirs = [];
@@ -63,7 +90,7 @@ for (const dir of dirs) {
 	const resolved = path.resolve(expandTilde(dir));
 	let stats;
 	try {
-		stats = statSync(resolved);
+		stats = fs.statSync(resolved);
 	} catch {
 		fail(`${dir}: no such directory`);
 	}
@@ -102,3 +129,138 @@ child.on("error", (error) => {
 child.on("exit", (code, signal) => {
 	process.exit(signal ? 128 + (os.constants.signals[signal] ?? 0) : (code ?? 0));
 });
+
+// ---------------------------------------------------------------------- setup
+
+/**
+ * Find `name` the way a shell would, without spawning one: walk PATH, and on
+ * Windows also try each PATHEXT suffix. Returns the full path, or null.
+ */
+function findOnPath(name) {
+	const dirs = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
+	const exts =
+		process.platform === "win32" ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";") : [""];
+	for (const dir of dirs) {
+		for (const ext of exts) {
+			const candidate = path.join(dir, name + ext);
+			try {
+				if (!fs.statSync(candidate).isFile()) continue;
+				fs.accessSync(candidate, fs.constants.X_OK);
+				return candidate;
+			} catch {
+				// not here, keep looking
+			}
+		}
+	}
+	return null;
+}
+
+/**
+ * Make `linkPath` a symlink to `target`, reporting what happened rather than
+ * asking first. A pre-existing symlink that already points at `target` is left
+ * alone and reported as such; anything else already at `linkPath` — someone
+ * else's file, a symlink pointing elsewhere — is left alone too, since setup
+ * should never clobber something it did not create.
+ */
+function ensureSymlink(target, linkPath, label, actions) {
+	try {
+		const st = fs.lstatSync(linkPath);
+		if (st.isSymbolicLink()) {
+			const current = path.resolve(path.dirname(linkPath), fs.readlinkSync(linkPath));
+			actions.push(
+				current === target ? `${label} already linked` : `${label}: left alone, already links elsewhere`,
+			);
+		} else {
+			actions.push(`${label}: left alone, something else is already there`);
+		}
+		return;
+	} catch (err) {
+		if (err.code !== "ENOENT") {
+			actions.push(`${label}: could not check what is there (${err.message})`);
+			return;
+		}
+	}
+	try {
+		fs.symlinkSync(target, linkPath);
+		actions.push(`linked ${label}`);
+	} catch (err) {
+		actions.push(`${label}: could not link it (${err.message})`);
+	}
+}
+
+/**
+ * `tin --setup`: everything the README's install block used to ask you to type
+ * by hand, minus the one part that is genuinely a choice — cloning the repo in
+ * the first place. Idempotent: run it again after installing a tool you did not
+ * have yet, and it links only what is new.
+ */
+function runSetup() {
+	const isWindows = process.platform === "win32";
+	// Resolved from this file's own real location — the one place --setup needs
+	// to know where the repo actually is, symlink or not.
+	const scriptPath = fs.realpathSync(fileURLToPath(import.meta.url));
+	const tinRoot = path.dirname(path.dirname(scriptPath));
+	const tinbin = path.join(os.homedir(), "tinbin");
+	const actions = [];
+
+	const extensionsDir = path.join(os.homedir(), ".pi", "agent", "extensions");
+	fs.mkdirSync(extensionsDir, { recursive: true });
+	ensureSymlink(path.join(tinRoot, "src"), path.join(extensionsDir, "tin"), "the pi extension", actions);
+
+	fs.mkdirSync(tinbin, { recursive: true });
+	actions.push(`~/tinbin ready at ${tinbin}`);
+
+	for (const name of WRAPPED_COMMANDS) {
+		if (!findOnPath(name)) {
+			actions.push(`${name}: not on PATH, skipped the read-only wrapper`);
+			continue;
+		}
+		const fileName = isWindows ? `${name}.mjs` : name;
+		const source = path.join(tinRoot, "wrappers", fileName);
+		ensureSymlink(source, path.join(tinbin, fileName), `${fileName} (read-only ${name})`, actions);
+	}
+
+	for (const name of INERT_COMMANDS) {
+		const found = findOnPath(name);
+		if (!found) {
+			actions.push(`${name}: not on PATH, skipped`);
+			continue;
+		}
+		// Windows needs the extension on the link name too, since that is the
+		// name the model calls it by.
+		const linkName = isWindows ? path.basename(found) : name;
+		ensureSymlink(found, path.join(tinbin, linkName), linkName, actions);
+	}
+
+	if (!findOnPath("cmake")) {
+		actions.push("cmake: not on PATH, skipped building tinjs");
+	} else {
+		const tinjsDir = path.join(tinRoot, "tinjs");
+		const buildDir = path.join(tinjsDir, "build");
+		try {
+			execFileSync("cmake", ["-S", tinjsDir, "-B", buildDir], { stdio: ["ignore", "ignore", "pipe"] });
+			actions.push("tinjs build configured");
+			execFileSync("cmake", ["--build", buildDir, "--config", "Release"], {
+				stdio: ["ignore", "ignore", "pipe"],
+			});
+			actions.push("tinjs built");
+
+			const builtBinary = isWindows
+				? path.join(buildDir, "Release", "tinjs.exe")
+				: path.join(buildDir, "tinjs");
+			if (fs.existsSync(builtBinary)) {
+				const linkName = isWindows ? "tinjs.exe" : "tinjs";
+				ensureSymlink(builtBinary, path.join(tinbin, linkName), linkName, actions);
+			} else {
+				actions.push("tinjs: build finished but the binary is missing, not linked");
+			}
+		} catch (err) {
+			const detail = err.stderr ? err.stderr.toString().trim().split("\n").pop() : err.message;
+			actions.push(`tinjs: build failed (${detail})`);
+		}
+	}
+
+	process.stdout.write("tin --setup\n");
+	for (const action of actions) process.stdout.write(`  • ${action}\n`);
+	process.stdout.write("\nDone!\n");
+}

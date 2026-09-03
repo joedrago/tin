@@ -167,7 +167,7 @@ test("the tinjs blurb states what is not there, so the model does not go looking
 		assert.ok(blurb.includes(capability), `blurb should rule out: ${capability}`);
 	}
 	// And what it does have, since that is what saves the wasted first attempt.
-	for (const api of ["read(path)", "readBytes(path)", "lines(path)", "print(...)", "exit(code)"]) {
+	for (const api of ["read(path)", "readBytes(path)", "readBytes(path, offset, length)", "stat(path)", "lines(path)", "print(...)", "exit(code)"]) {
 		assert.ok(blurb.includes(api), `blurb should offer: ${api}`);
 	}
 	// readStdin is gone: tin closes stdin, so a model told about it would get an
