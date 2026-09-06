@@ -25,8 +25,10 @@ set -eu
 
 # --- the real git ---------------------------------------------------------------
 #
-# PATH inside tin is the allowlist directory and nothing else, so "git" here would
-# find this script again. The real binary has to be named outright.
+# The real binary is named outright rather than looked up, so that this wrapper does not
+# depend on whatever PATH it inherits — and because plenty of people put their allowlist
+# directory on their own PATH to use these wrappers by hand, where a bare "git" would find
+# this script again and recurse.
 
 GIT=""
 for candidate in "${TIN_GIT-}" /usr/bin/git /usr/local/bin/git /opt/homebrew/bin/git /bin/git; do
@@ -192,12 +194,17 @@ esac
 
 # --- run it ---------------------------------------------------------------------
 
-# Anything git might read out of the environment and turn into a program.
+# Anything git might read out of the environment and turn into a program. tin passes
+# your environment through, so these arrive if you have them set and this list is the
+# thing that stops them. GIT_EXEC_PATH is the one to notice: it names the directory git
+# loads its own subcommands from, so setting it makes "git log" run git-log from
+# somewhere else entirely. It is the environment's version of --exec-path, which is
+# refused above, and the two belong together.
 unset GIT_EXTERNAL_DIFF GIT_CONFIG GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM \
 	GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
 	GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE \
 	GIT_EDITOR GIT_SEQUENCE_EDITOR GIT_SSH GIT_SSH_COMMAND GIT_PROXY_COMMAND \
-	GIT_ASKPASS GIT_ATTR_SOURCE 2>/dev/null || true
+	GIT_ASKPASS GIT_ATTR_SOURCE GIT_EXEC_PATH 2>/dev/null || true
 
 GIT_PAGER=cat
 PAGER=cat

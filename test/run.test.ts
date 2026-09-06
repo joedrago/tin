@@ -75,8 +75,33 @@ test("execution is disabled when the command directory is writable", () => {
 	assert.throws(() => resolveCommand("echo", fx.policy), TinDenied);
 });
 
-test("the child environment carries no secrets and only sees allowed commands", () => {
+test("the child inherits the environment untouched, PATH included", () => {
 	const fx = fixture();
+	const env = buildChildEnv(fx.policy, {
+		HOME: fx.home,
+		PATH: "/usr/bin:/bin",
+		TERM: "xterm-256color",
+		MY_PROJECT_ROOT: "/srv/thing",
+	});
+
+	// binDir is what tin_run resolves a command name against, not a search path. It
+	// stays off PATH so a wrapper that calls `git` gets git rather than itself.
+	assert.equal(env.PATH, "/usr/bin:/bin");
+	assert.equal(env.HOME, fx.home);
+	assert.equal(env.TERM, "xterm-256color");
+	assert.equal(env.MY_PROJECT_ROOT, "/srv/thing");
+});
+
+test("exec.env is applied last and overrides an inherited variable", () => {
+	const fx = fixture({ exec: { env: { TERM: "dumb", TIN_MARKER: "set" } } });
+	const env = buildChildEnv(fx.policy, { TERM: "xterm-256color" });
+
+	assert.equal(env.TERM, "dumb");
+	assert.equal(env.TIN_MARKER, "set");
+});
+
+test("inheritEnv false builds from scratch and carries no secrets", () => {
+	const fx = fixture({ exec: { inheritEnv: false } });
 	const env = buildChildEnv(fx.policy, {
 		HOME: fx.home,
 		PATH: "/usr/bin:/bin",
@@ -228,8 +253,40 @@ test("exit codes and stderr come back intact", async () => {
 	assert.match(formatOutcome("fail", [], outcome), /exited with code 3/);
 });
 
-test("a child process only finds allowed commands on PATH", async () => {
+test("a wrapper script can call an ordinary tool off the real PATH", async () => {
 	const fx = fixture();
+	script(fx, "helper", "#!/bin/sh\nid -u\n");
+
+	const outcome = await execCommand(resolveCommand("helper", fx.policy), [], {
+		cwd: fx.workspace,
+		env: buildChildEnv(fx.policy),
+		policy: fx.policy,
+	});
+
+	assert.equal(outcome.exitCode, 0);
+	assert.match(outcome.stdout.trim(), /^\d+$/);
+});
+
+// The allowlist is tin_run's lookup table and nothing more. A wrapper that says `id`
+// means the real id, even with something of that name linked next to it — which is
+// what keeps a script in binDir from having to know what else is in binDir.
+test("an entry in the allowlist does not shadow the real tool for a wrapper", async () => {
+	const fx = fixture();
+	script(fx, "id", "#!/bin/sh\necho shadowed\n");
+	script(fx, "caller", "#!/bin/sh\nid -u\n");
+
+	const outcome = await execCommand(resolveCommand("caller", fx.policy), [], {
+		cwd: fx.workspace,
+		env: buildChildEnv(fx.policy),
+		policy: fx.policy,
+	});
+
+	assert.equal(outcome.exitCode, 0);
+	assert.match(outcome.stdout.trim(), /^\d+$/);
+});
+
+test("under inheritEnv false a child process only finds allowed commands", async () => {
+	const fx = fixture({ exec: { inheritEnv: false } });
 	script(fx, "sneak", "#!/bin/sh\nid\n");
 
 	const outcome = await execCommand(resolveCommand("sneak", fx.policy), [], {
@@ -264,7 +321,9 @@ test("output past the byte limit is truncated and flagged", async () => {
 
 test("a command that outlives its timeout is killed", async () => {
 	const fx = fixture();
-	// sleep has to be linked too: the child's PATH is the allowlist directory.
+	// sleep is found on the inherited PATH now; it stays linked so that the run is the
+	// same process tree it always was, and so the test still means something under
+	// inheritEnv false.
 	const sleep = ["/bin/sleep", "/usr/bin/sleep"].find((candidate) => existsSync(candidate));
 	assert.ok(sleep, "no sleep binary to link");
 	link(fx, "sleep", sleep);

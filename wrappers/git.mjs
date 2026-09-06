@@ -46,8 +46,10 @@ function refuse(message) {
 
 // --- the real git ---------------------------------------------------------------
 //
-// PATH inside tin is the allowlist directory and nothing else, so "git" here would
-// find this script again. The real binary has to be named outright.
+// The real binary is named outright rather than looked up, so that this wrapper does not
+// depend on whatever PATH it inherits — and because plenty of people put their allowlist
+// directory on their own PATH to use these wrappers by hand, where a bare "git" would find
+// this script again and recurse.
 
 function gitCandidates(env) {
 	if (process.platform === "win32") {
@@ -258,7 +260,7 @@ const STRIPPED_ENV = new Set(
 	`GIT_EXTERNAL_DIFF GIT_CONFIG GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_PARAMETERS
 	 GIT_CONFIG_COUNT GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY
 	 GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_EDITOR GIT_SEQUENCE_EDITOR GIT_SSH
-	 GIT_SSH_COMMAND GIT_PROXY_COMMAND GIT_ASKPASS GIT_ATTR_SOURCE`
+	 GIT_SSH_COMMAND GIT_PROXY_COMMAND GIT_ASKPASS GIT_ATTR_SOURCE GIT_EXEC_PATH`
 		.split(/\s+/)
 		.map((name) => name.toLowerCase()),
 );

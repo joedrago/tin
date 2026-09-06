@@ -8,6 +8,12 @@ import { canonicalize, expandTilde, isInside } from "./paths.ts";
  * Shape of ~/.pi/agent/tin.json. Every field is optional; the defaults are the
  * strict ones, so a missing, malformed, or partially-written config can only ever
  * leave you more restricted than you asked for, never less.
+ *
+ * `exec.inheritEnv` is the one default that is not the strict one. What may run at
+ * all is the allowlist directory's decision, and an entry there was linked to be
+ * trusted with everything it can already reach; starving it of PATH and of the
+ * environment does not take that back, it only makes ordinary wrappers fail. Set it
+ * to false to get the built-from-scratch environment, which is what `passEnv` is for.
  */
 export interface TinConfigFile {
 	/** Directory of symlinks to the commands tin_run may execute. Default ~/tinbin */
@@ -24,9 +30,14 @@ export interface TinConfigFile {
 		maxOutputLines?: number;
 		/** Ceiling on a captured output file. Far larger than the in-context caps. */
 		maxCaptureBytes?: number;
-		/** Environment variables copied from pi's own environment into the child. */
+
+		// How the child's environment is built. Default true: it inherits pi's whole
+		// environment, PATH included and unmodified. False builds it from scratch, and
+		// `passEnv` then names what is carried over; it is ignored entirely otherwise.
+		inheritEnv?: boolean;
 		passEnv?: string[];
-		/** Environment variables set explicitly on the child. */
+
+		/** Environment variables set explicitly on the child, applied last either way. */
 		env?: Record<string, string>;
 	};
 }
@@ -36,7 +47,11 @@ export interface TinExecPolicy {
 	maxOutputBytes: number;
 	maxOutputLines: number;
 	maxCaptureBytes: number;
+
+	// See TinConfigFile.exec: passEnv is only consulted when inheritEnv is false.
+	inheritEnv: boolean;
 	passEnv: string[];
+
 	env: Record<string, string>;
 }
 
@@ -71,6 +86,11 @@ export interface TinPolicy {
 
 export const DEFAULT_DENY_SEGMENTS = [".git", ".pi", ".agents"];
 
+/**
+ * The variables an exec.inheritEnv=false session carries over. Both of these lists
+ * are dead weight in the default configuration, where the child inherits everything;
+ * they are the floor for the from-scratch environment, not a filter applied to yours.
+ */
 const POSIX_PASS_ENV = ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TMPDIR"];
 
 /**
@@ -112,7 +132,14 @@ const DEFAULT_EXEC: TinExecPolicy = {
 	// real log is not. In practice exec.timeoutMs binds first for most commands.
 	maxCaptureBytes: 4 * 1024 ** 3,
 
+	// The child inherits pi's environment. The allowlist directory is what decides
+	// whether a program runs at all, and everything in it was linked on the
+	// understanding that it can do what that program can do — so a wrapper there
+	// calling realpath, or reading a variable that was set in the shell that started
+	// pi, is the design working rather than a hole in it. See buildChildEnv.
+	inheritEnv: true,
 	passEnv: DEFAULT_PASS_ENV,
+
 	env: {},
 };
 
@@ -291,6 +318,8 @@ export function buildPolicy(options: BuildPolicyOptions): TinPolicy {
 		maxOutputBytes: positiveNumber(file.exec?.maxOutputBytes, DEFAULT_EXEC.maxOutputBytes),
 		maxOutputLines: positiveNumber(file.exec?.maxOutputLines, DEFAULT_EXEC.maxOutputLines),
 		maxCaptureBytes: positiveNumber(file.exec?.maxCaptureBytes, DEFAULT_EXEC.maxCaptureBytes),
+		inheritEnv:
+			typeof file.exec?.inheritEnv === "boolean" ? file.exec.inheritEnv : DEFAULT_EXEC.inheritEnv,
 		passEnv: stringArray(file.exec?.passEnv) ?? DEFAULT_EXEC.passEnv,
 		env: typeof file.exec?.env === "object" && file.exec.env ? file.exec.env : {},
 	};

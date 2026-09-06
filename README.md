@@ -143,7 +143,9 @@ thing.
 
 Genuinely inert, for a starting point: `jq`, `grep`, `wc`, `cut`, `tr`, `uniq`, `comm`,
 `diff`, `strings`, `xxd`, `base64`, `head`, `tail`, `file`, `stat`. None of them has a flag
-that writes a file or starts a program.
+that writes a file or starts a program. Inert is not the same as blind, though: `jq -n env`
+prints the environment it was given, which by default is yours. If that environment holds a
+secret, `jq` is enough to read it — see [`exec.inheritEnv`](#execinheritenv-false).
 
 If what you wanted from `python` or `node` was a scratch script to chew on some data,
 [`tinjs`](#tinjs) is that without the general code execution.
@@ -155,9 +157,12 @@ to hand over is one capability, which means a small script in `~/tinbin` that pi
 dangerous parts and passes the rest through. A few things are worth knowing before you
 write one:
 
-- **`PATH` is the allowlist directory.** Your script cannot call `grep`, `sed`, `cut` or
-  `cat` — they are not on it. Use shell builtins, and call the real tool by absolute
-  path.
+- **`PATH` is yours, unchanged.** `grep`, `sed`, `cut` and `realpath` are all reachable,
+  so a wrapper is written the way you would write any other script. `~/tinbin` is *not*
+  added to it: that directory is the table `tin_run` resolves a command name against, and
+  what a script finds once it is running is a different question with a different answer.
+  Under `exec.inheritEnv: false` the old rule applies instead — nothing but `binDir` is on
+  `PATH`, and absolute paths are the only way out.
 - **Pin credentials and targets, and refuse the flags that change them.** Reads are
   unrestricted, so a model can find the passwords in your config files. A wrapper that
   pins a low-privilege account is only worth something if it also refuses the flag that
@@ -182,9 +187,11 @@ ln -s /path/to/tin/wrappers/git ~/tinbin/git
 ```
 
 They are POSIX shell scripts with no dependencies beyond the tool they wrap, written to
-the rules above: because `PATH` is the allowlist directory, each calls the real binary by
-absolute path, chosen from a short list of the usual locations at the top of the script.
-Edit that list if yours lives somewhere else. Read the one you link before you link it —
+the rules above: each calls the real binary by absolute path, chosen from a short list of
+the usual locations at the top of the script. Edit that list if yours lives somewhere
+else. Naming it outright rather than looking it up keeps the wrapper independent of the
+`PATH` it inherits — including your own, if you have put `~/tinbin` on it to use these
+by hand, where a bare `git` would find the wrapper again and recurse. Read the one you link before you link it —
 you are the one who ends up trusting it.
 
 Windows has no `/bin/sh`, so a wrapper that is worth having there is written for Node
@@ -218,6 +225,11 @@ into an exec:
   `diff.external`, `core.fsmonitor`, `gpg.program`, hooks path — so a repository that
   sets one does not get to use it. `--no-optional-locks` keeps a plain `status` from
   rewriting the index, so the read stays a read.
+- **The `GIT_*` variables that name a program are unset**, `GIT_EXTERNAL_DIFF`,
+  `GIT_SSH_COMMAND`, `GIT_ASKPASS`, the `GIT_CONFIG_*` family and `GIT_EXEC_PATH` among
+  them. This is the list that matters most now that the child inherits your environment:
+  `GIT_EXEC_PATH` names the directory git loads `git-log` and its other subcommands from,
+  which makes it `--exec-path` by another route.
 
 ### `rg` — ripgrep without its exec flags
 
@@ -229,16 +241,19 @@ flags that hand it a program, and the wrapper is mostly those:
   exists only to steer the first. `--pre` runs a command of your choosing on every file
   before searching it, which is general code execution wearing a search flag.
 - **`--no-config` is passed on every call**, and `RIPGREP_CONFIG_PATH` is unset. A config
-  file can contain `--pre` as easily as a command line can. tin does not carry that
-  variable into a child anyway, but a wrapper that is only correct because of something
-  another file does is a wrapper that breaks quietly when that file changes.
+  file can contain `--pre` as easily as a command line can. tin used to drop that variable
+  on its way into the child and no longer does, which is exactly why the wrapper never
+  leaned on it: a wrapper that is only correct because of something another file does is a
+  wrapper that breaks quietly when that file changes. This one did not.
 - **Everything after `--` is left alone**, so a pattern that looks like a flag is still
   searchable. Before it, an argument that merely resembles one of the refused flags is
   refused rather than reasoned about.
 
-`-z`/`--search-zip` is deliberately left working. It runs a decompressor, but only one it
-can find on `PATH`, and `PATH` inside tin is the allowlist directory — so it reaches a
-decompressor exactly when you have linked one, which is a decision you already made.
+`-z`/`--search-zip` is deliberately left working. It runs a decompressor it finds on
+`PATH`, choosing it by the file's extension rather than from anything in the arguments —
+so what it can reach is `gzip`, `xz`, `zstd` and their handful of siblings, and never a
+program the model named. Under `exec.inheritEnv: false` it narrows further, to whichever
+of those you have linked yourself.
 
 `test/wrapper-rg.test.ts` covers the Node one.
 
@@ -395,6 +410,7 @@ falls back to those defaults rather than to something more permissive.
     "maxOutputBytes": 100000,
     "maxOutputLines": 2000,
     "maxCaptureBytes": 4294967296,
+    "inheritEnv": true,
     "passEnv": ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TMPDIR"],
     "env": {}
   }
@@ -415,14 +431,21 @@ falls back to those defaults rather than to something more permissive.
   different kind of limit from `maxOutputBytes` and `maxOutputLines` above it: those keep
   a command's output from swamping the conversation, this one only keeps a runaway from
   filling the disk, so it is set where a mistake is still caught and a real log is not.
+- **`exec.inheritEnv`** — whether an allowed command inherits pi's environment. True by
+  default, which is the one default here that is not the strict one; see [what the child
+  process gets](#what-the-child-process-gets) for why, and for when to turn it off.
+- **`exec.passEnv`** — the variables carried over when `inheritEnv` is false. Ignored
+  otherwise.
 
 One setting also has an environment variable, `TIN_EXTRA_WRITE_ROOTS`: a delimiter-separated
 list of directories, in the shape of `PATH`, *added* to whatever `writeRoots` resolved to
 rather than replacing it. This is what [`bin/tin`](#extra-write-roots-for-one-session) sets,
 and setting it yourself does the same thing. It is read once, at session start, from pi's own
-environment — somewhere the model cannot reach, since `tin_run` builds its children an
-environment from scratch and never passes this one on. The roots it names are checked exactly
-as configured roots are, so naming one that contains `binDir` disables execution just the same.
+environment. Allowed commands inherit it by default and are welcome to: the roots it names are
+already in the system prompt and in `/tin`. What keeps it out of the model's reach is that
+`tin_run` takes a command and an argument array and no environment, so nothing the model runs
+can set it for a later session. The roots it names are checked exactly as configured roots are,
+so naming one that contains `binDir` disables execution just the same.
 
 The config is read from your home directory and never from the project, because the model
 can write in the project — a project-local policy file would be a policy the model edits.
@@ -437,17 +460,56 @@ by not being one; work inside it and editing it is the whole reason you are ther
 
 ## What the child process gets
 
-`tin_run` builds the environment from scratch instead of inheriting yours:
+`tin_run` hands the child your environment as it is. `PATH` included, `TERM` included,
+everything; `exec.env` is applied last and wins over any of it.
 
-- `PATH` is `~/tinbin` and nothing else, so a command that shells out internally also finds
-  only allowed commands.
-- `TERM=dumb`, and only the variables in `passEnv` are carried over. API keys, tokens,
-  `SSH_AUTH_SOCK` and the rest of your environment are not passed to whatever runs. On
-  Windows the default list also carries `SystemRoot`, `windir`, `SystemDrive`, `ComSpec`,
-  `PATHEXT`, `USERPROFILE`, `USERNAME`, `APPDATA`, `LOCALAPPDATA`, `TEMP`, `TMP`,
-  `NUMBER_OF_PROCESSORS` and `PROCESSOR_ARCHITECTURE`, without which most programs there
-  fail in ways that are hard to read. Setting `passEnv` yourself replaces the whole list,
-  Windows names included.
+This is a deliberate reversal of how tin started, which was to build the environment from
+scratch and carry over a short list. The reasoning: `~/tinbin` is the whole execution
+decision, and anything linked there was linked on the understanding that it can do what
+that program can do — a wrapper in it is already allowed to run whatever it likes. Starving
+it of `PATH` did not take that back; it only made ordinary wrappers fail in confusing ways.
+Reads are unrestricted too, so an environment variable is not somewhere the model could not
+have looked anyway. And the model cannot *set* any of this: `tin_run` takes a command and an
+argument array and no environment.
+
+**`~/tinbin` is not on that `PATH`, on purpose.** It is the table `tin_run` resolves a
+command name against — the tool joins the directory with the name it was given and never
+consults `PATH` at all — and that is the entirety of its job. What a script finds once it is
+running is a separate question, and the answer is your `PATH`, because what your scripts do
+is your decision. Prepending it would also mean a wrapper that calls `git` found *itself*,
+which is a hazard every script in the directory would then have to know about.
+
+The one consequence worth stating plainly: **a variable can be a credential rather than a
+fact.** `SSH_AUTH_SOCK` is the sharp one. It is not something to read — its value is a
+socket path that tells you nothing — it is the ability to have your `ssh-agent` sign a
+challenge, which is the whole of authenticating as you. The key on disk is encrypted and
+useless to a reader; the agent holds the decrypted one. So this is the case that does not
+follow from "reads are unrestricted anyway," and it reaches any allowed command that can
+open a unix socket. It costs nothing while nothing in `~/tinbin` speaks ssh — the read-only
+`git` wrapper does not, having no networked subcommand and unsetting `GIT_SSH*` besides —
+but linking the real `ssh` or the real `git` used to hand over a client with no credentials,
+and now hands over your agent. `exec.env` can pin it out without giving up inheritance:
+
+```json
+"exec": { "env": { "SSH_AUTH_SOCK": "" } }
+```
+
+### `exec.inheritEnv: false`
+
+Setting it restores the original behaviour: the environment is built from scratch, `PATH` is
+`~/tinbin` alone, `TERM=dumb`, and only the variables named in `passEnv` are carried over —
+by default `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `TZ` and `TMPDIR`. On Windows the
+default list also carries `SystemRoot`, `windir`, `SystemDrive`, `ComSpec`, `PATHEXT`,
+`USERPROFILE`, `USERNAME`, `APPDATA`, `LOCALAPPDATA`, `TEMP`, `TMP`, `NUMBER_OF_PROCESSORS`
+and `PROCESSOR_ARCHITECTURE`, without which most programs there fail in ways that are hard to
+read. Setting `passEnv` yourself replaces the whole list, Windows names included; it is
+ignored entirely while `inheritEnv` is true.
+
+Worth it in two cases. If you link real binaries rather than wrappers, the narrow `PATH` is a
+real second line: `find -exec sh -c` and `fd -x` have to find `sh` before they can run it, and
+under this setting there is nowhere to find it. And if pi's environment holds a credential you
+would rather no allowed command could use, this is the setting that keeps it out — bearing in
+mind that `jq -n env` prints the environment, and `jq` is on the inert list above.
 - stdin is closed, so nothing sits waiting for input. Nothing is piped in either: a
   command that only reads stdin has no way to be fed, and the way output travels between
   commands is [capture](#capturing-output) and a path.

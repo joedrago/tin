@@ -29,9 +29,11 @@ import {
  * list of directories, added to the configured roots rather than replacing them.
  * `bin/tin` sets it from its command line.
  *
- * It is read from pi's own environment, which is not somewhere the model can reach:
- * tin_run builds its child environment from scratch, so nothing the model runs can
- * set this for a later session, and the variable is consulted once at session start.
+ * It is read from pi's own environment once, at session start. Allowed commands do
+ * inherit it by default, but seeing it grants nothing — the roots it names are already
+ * in the system prompt and in /tin. What matters is that nothing the model runs can
+ * *set* it for a later session: tin_run takes a command and an argument array and no
+ * environment, so the only way in is the process that started pi.
  */
 export const EXTRA_ROOTS_ENV = "TIN_EXTRA_WRITE_ROOTS";
 
@@ -204,11 +206,26 @@ export default function tin(pi: ExtensionAPI) {
 				`captures    ${captureState(active.captureDir)}`,
 				`commands    ${active.execEnabled ? active.binDir : "(execution disabled)"}`,
 				`            ${commands.join(", ") || "(none linked)"}`,
+				`environment ${describeChildEnv(active)}`,
 				...active.warnings.map((warning) => `warning     ${warning}`),
 			];
 			ctx.ui.notify(report.join("\n"), active.warnings.length > 0 ? "warning" : "info");
 		},
 	});
+}
+
+/**
+ * What an allowed command's environment looks like, for /tin.
+ *
+ * Worth a line of its own because it is the one policy here whose default is the
+ * permissive one, so "inherited" should be something you saw rather than assumed.
+ */
+function describeChildEnv(policy: TinPolicy): string {
+	const pinned = Object.keys(policy.exec.env);
+	const overrides = pinned.length > 0 ? `, then exec.env pins ${pinned.join(", ")}` : "";
+	return policy.exec.inheritEnv
+		? `inherited from pi, PATH and all${overrides}`
+		: `built from scratch, PATH is ${policy.binDir}, carrying ${policy.exec.passEnv.join(", ") || "nothing"}${overrides}`;
 }
 
 /**

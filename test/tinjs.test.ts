@@ -20,7 +20,11 @@ const binary = path.join(
  */
 const needsTinjs = { skip: existsSync(binary) ? false : "tinjs is not built" };
 
-/** Run tinjs the way tin_run would: through the allowlist, in tin's child environment. */
+/**
+ * Run tinjs the way tin_run would: through the allowlist, in tin's child environment.
+ * The parent is empty rather than this process's, so what tinjs does is not coloured by
+ * whatever happens to be exported in the shell running the tests.
+ */
 async function run(args: string[]) {
 	const fx = fixture();
 	link(fx, "tinjs", binary);
@@ -33,7 +37,7 @@ async function run(args: string[]) {
 	return { fx, outcome };
 }
 
-test("tinjs runs under tin's stripped child environment", needsTinjs, async () => {
+test("tinjs runs with nothing in its environment at all", needsTinjs, async () => {
 	const { outcome } = await run(["-e", "print(1 + 1)"]);
 	assert.equal(outcome.exitCode, 0);
 	assert.equal(outcome.stdout.trim(), "2");

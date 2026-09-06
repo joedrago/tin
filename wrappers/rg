@@ -21,22 +21,27 @@
 # the allowlist exists to prevent, so all three are refused below.
 #
 # A third route is not a flag at all: rg reads a config file named by
-# RIPGREP_CONFIG_PATH and takes flags — including --pre — out of it. tin builds its
-# children an environment from scratch and does not carry that variable over, so it
-# is already closed, but relying on that would make this wrapper correct only by
-# something another file does. --no-config is passed on every call instead.
+# RIPGREP_CONFIG_PATH and takes flags — including --pre — out of it. tin used to build
+# its children an environment from scratch, which closed this by accident; it now passes
+# yours through, so the variable does arrive. This wrapper never relied on that either
+# way, on the grounds that being correct only because of something another file does is
+# a wrapper that breaks quietly. --no-config is passed on every call, and the variable is
+# unset below.
 #
-# -z/--search-zip is left alone deliberately. It runs a decompressor, but only one
-# it can find on PATH, and PATH inside tin is the allowlist directory — so it can
-# reach a decompressor exactly when you have allowlisted one, which is your
-# decision to have already made.
+# -z/--search-zip is left alone deliberately. It runs a decompressor it finds on PATH,
+# picked from the file's extension rather than from anything in the arguments — so the
+# most it reaches is gzip, xz, zstd and their few siblings, never a program named by
+# whoever called this. Set exec.inheritEnv false in tin.json if you want that narrowed
+# to the decompressors you have allowlisted yourself.
 
 set -eu
 
 # --- the real rg ----------------------------------------------------------------
 #
-# PATH inside tin is the allowlist directory and nothing else, so "rg" here would
-# find this script again. The real binary has to be named outright.
+# The real binary is named outright rather than looked up, so that this wrapper does not
+# depend on whatever PATH it inherits — and because plenty of people put their allowlist
+# directory on their own PATH to use these wrappers by hand, where a bare "rg" would find
+# this script again and recurse.
 
 RG=""
 for candidate in "${TIN_RG-}" /usr/bin/rg /usr/local/bin/rg /opt/homebrew/bin/rg /bin/rg /snap/bin/rg; do

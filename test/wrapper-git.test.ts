@@ -238,6 +238,8 @@ test("the environment git runs in carries nothing it can turn into a program", (
 		GIT_CONFIG_GLOBAL: "/tmp/evil",
 		GIT_DIR: "/tmp/elsewhere",
 		GIT_ASKPASS: "sh",
+		// The environment's --exec-path: git loads git-log and the rest from here.
+		GIT_EXEC_PATH: "/tmp/evil",
 		// Windows environment names are case-insensitive, so this is the same variable.
 		Git_Editor: "sh",
 		HOME: "/home/joe",
@@ -249,6 +251,7 @@ test("the environment git runs in carries nothing it can turn into a program", (
 		"GIT_CONFIG_GLOBAL",
 		"GIT_DIR",
 		"GIT_ASKPASS",
+		"GIT_EXEC_PATH",
 		"Git_Editor",
 	]) {
 		assert.equal(env[key], undefined, key);

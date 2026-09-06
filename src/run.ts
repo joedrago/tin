@@ -107,22 +107,53 @@ export function listCommands(policy: TinPolicy): string[] {
 }
 
 /**
- * Build the child environment from scratch.
+ * Build the child environment.
  *
- * Only the listed variables are carried over, so API keys, tokens, and agent
- * variables in pi's environment are not handed to whatever gets run. PATH is the
- * allowlist directory itself, so a command that shells out finds only allowed
- * commands too.
+ * By default the child inherits pi's environment untouched, PATH included, because
+ * withholding it never bought anything: binDir decides what may run at all, and an
+ * entry there was linked on the understanding that it can do whatever that program
+ * can do. A wrapper script is the ordinary case, and one that cannot call `realpath`
+ * or see a variable from the shell that started pi is just a broken wrapper. Reads
+ * are unrestricted anyway, so there is nothing here to hide from the model that it
+ * could not go and read.
+ *
+ * binDir is deliberately *not* added to PATH. It is the table tin_run resolves a
+ * command name against — see resolveCommand, which only ever joins it with the name
+ * and never consults PATH — and that is the whole of its job. What a script finds
+ * once it is running is a separate question, and the answer to it is your PATH,
+ * because what your scripts do is your decision. Putting binDir in front would also
+ * mean a wrapper calling `git` found itself rather than git, which is a hazard every
+ * script in there would have to know about.
+ *
+ * The model cannot set any of this: tin_run takes a command and an argument array and
+ * no environment, so every variable comes from pi's own process or from exec.env.
+ *
+ * exec.inheritEnv=false restores the from-scratch build, where only exec.passEnv is
+ * carried over and PATH is binDir alone. It is the right setting if you link real
+ * binaries rather than wrappers — the narrow PATH is what keeps `find -exec` and
+ * `rg -z` from reaching a program you never allowlisted — or if pi's environment holds
+ * a credential, SSH_AUTH_SOCK above all, that you would rather no allowed command
+ * could use. Either way exec.env is applied last and wins.
  */
 export function buildChildEnv(
 	policy: TinPolicy,
 	parent: NodeJS.ProcessEnv = process.env,
 ): Record<string, string> {
-	const env: Record<string, string> = { PATH: policy.binDir, TERM: "dumb" };
-	for (const key of policy.exec.passEnv) {
-		const value = parent[key];
-		if (typeof value === "string") env[key] = value;
+	const env: Record<string, string> = {};
+
+	if (policy.exec.inheritEnv) {
+		for (const [key, value] of Object.entries(parent)) {
+			if (typeof value === "string") env[key] = value;
+		}
+	} else {
+		env.PATH = policy.binDir;
+		env.TERM = "dumb";
+		for (const key of policy.exec.passEnv) {
+			const value = parent[key];
+			if (typeof value === "string") env[key] = value;
+		}
 	}
+
 	return { ...env, ...policy.exec.env };
 }
 
@@ -299,8 +330,9 @@ export function buildLaunch(command: ResolvedCommand, args: string[]): Launch {
 	// so process.execPath is the interpreter, known exactly rather than searched for.
 	// Arguments go straight into argv with no shell and no cmd in the way. Node reads
 	// none of its own options from this list either: everything after the script path
-	// is the script's. NODE_OPTIONS would still be read, but tin builds the child
-	// environment itself and does not carry it over.
+	// is the script's. NODE_OPTIONS is read, and by default inherited — but it is your
+	// NODE_OPTIONS, the one pi is already running under, and the model has no way to
+	// set it. exec.inheritEnv=false drops it along with everything else.
 	if (WINDOWS_NODE_SCRIPT.test(command.link)) {
 		return { file: process.execPath, args: [command.link, ...args], verbatim: false };
 	}
