@@ -45,12 +45,24 @@ And a handful that only compute — a value in, a value out, nothing touched:
     gzip(data, level) / gunzip(data)       .gz files
     deflate(data, level) / inflate(data)   zlib streams
     deflateRaw / inflateRaw                bare deflate, as inside a zip entry
+    unxz(data)                             .xz files (decompress only)
     md5(data), sha1(data), sha256(data)    hashes, as lowercase hex
     crc32(data), adler32(data)             checksums, as numbers
     TextEncoder, TextDecoder               utf-8; utf-16le/be and latin1 to decode
 
 `data` is a string (taken as UTF-8), an `ArrayBuffer`, or any typed array; the
 compressors return a `Uint8Array`. `level` is zlib's 0–9, 6 by default.
+
+A few habits from Node are caught rather than left to go quietly wrong. The
+decompressors refuse a string, because one is almost always `read()` where
+`readBytes()` was meant, and `read()` has already mangled the bytes. A level
+that is not a whole number from 0 to 9 throws, so a Node-style callback in its
+place is an error instead of level 0 and a callback that never runs. And
+everything returns a `Uint8Array` rather than a Node `Buffer`, so `.toString()`
+gives comma-separated numbers: text comes from `new TextDecoder().decode(bytes)`.
+`inspect` and `print` show the first 100 items of an array and summarise the
+rest, so printing a decompressed file by mistake costs a few lines rather than
+a line per byte.
 
 Reads are unrestricted, the same as everywhere else in tin: it is all your own
 machine. `read` decodes UTF-8; `readBytes` returns a copy of the bytes, so writing
@@ -138,10 +150,11 @@ in front of it, so a file with CRLF endings reads the same as one without. A
 last line with no newline after it is still a line, and blank lines come back as
 empty strings rather than being skipped.
 
-A file that begins with gzip's magic bytes is inflated on the way in, so
-`lines("access.log.1.gz")` is the same loop as on the live log, in the same
-constant memory. Concatenated members are followed through, each one's CRC is
-checked, and a truncated or corrupt file throws partway through rather than
+A file that begins with gzip's or xz's magic bytes is decompressed on the way
+in, so `lines("access.log.1.gz")` is the same loop as on the live log, in the
+same constant memory (plus xz's dictionary, which is 8 MB for a default `xz`
+file and 64 MB for `xz -9`). Concatenated files are followed through, every
+checksum is checked, and a truncated or corrupt file throws partway through rather than
 quietly ending early.
 
 There is deliberately no byte-wise counterpart. `lines` exists because logs and
@@ -153,7 +166,10 @@ a case that has not come up.
 The compression functions are zlib's, with Node's names: `gzip`/`gunzip` for
 `.gz` files, `deflate`/`inflate` for the zlib-wrapped stream that HTTP, PNG and
 git objects use, and the `Raw` pair for a bare stream such as a zip entry
-holds. With `readBytes` slices that is enough to read inside an archive without
+holds. `unxz` reads `.xz` — every integrity check and BCJ filter, and
+concatenated streams — but there is no `xz` to go with it: the decoder
+vendored for it has no encoder, and reading is the case that comes up. With
+`readBytes` slices that is enough to read inside an archive without
 unpacking it, which tinjs could not do anyway.
 
 ```js
@@ -240,8 +256,9 @@ at the same size is one number to remember instead of two.
 
 No dependencies, no network, nothing to install. The engine is vendored in
 [`quickjs/`](quickjs/VENDORED.md) — four C files, byte-for-byte from the upstream
-tarball — and compression in [`miniz/`](miniz/VENDORED.md), one more, built with
-its file and zip-archive code compiled out.
+tarball — compression in [`miniz/`](miniz/VENDORED.md), one more, built with its
+file and zip-archive code compiled out, and the `.xz` decoder in
+[`xz/`](xz/VENDORED.md), a few more with nothing to compile out.
 
 ```sh
 cmake -S tinjs -B tinjs/build
@@ -289,6 +306,7 @@ a script cannot see from inside itself: exit codes, the limits, and stderr.
     src/prelude.js     console, inspect and the friendly names, in JavaScript
     quickjs/           vendored engine, minus its host bindings
     miniz/             vendored deflate/inflate, minus its file and zip code
+    xz/                vendored XZ Embedded, the .xz decoder
     test/              the two suites and their fixtures
 
 `src/tinjs.c` is the part that has to be audited, so everything that did not have

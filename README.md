@@ -268,9 +268,9 @@ allowlist exists to prevent.
 it cannot write. Standard ES2023 is all there — regular expressions with named groups
 and lookbehind, `JSON`, `Map`, `Set`, typed arrays, `Date`, `BigInt`, classes,
 `async`/`await` — plus `read`, `readBytes` (whole file or a byte slice by offset and
-length), `stat`, `readdir`, `walk`, `readlink`, `lines` (gzipped files too), `print`,
+length), `stat`, `readdir`, `walk`, `readlink`, `lines` (`.gz` and `.xz` files too), `print`,
 `console`, `inspect`, `args` and `exit`, and a handful that only compute: `gzip` and
-`deflate` with their inverses, `md5`/`sha1`/`sha256`, `crc32`/`adler32`, and
+`deflate` with their inverses, `unxz`, `md5`/`sha1`/`sha256`, `crc32`/`adler32`, and
 `TextEncoder`/`TextDecoder`. Nothing else. There is no function that creates a file, opens a socket, starts a process,
 reads the environment or loads a module, because the engine's host bindings are not
 compiled into the binary at all.

@@ -17,6 +17,11 @@
 	const MAX_DEPTH = 4;
 	const WRAP_WIDTH = 72;
 
+	// How many items of an array inspect() shows before summarising the rest, as
+	// Node does. Without it, printing a decompressed file or a readBytes() result
+	// puts every byte of it on stdout, one per line.
+	const MAX_ITEMS = 100;
+
 	function quote(s) {
 		const body = s
 			.replace(/\\/g, "\\\\")
@@ -33,6 +38,28 @@
 		if (flat.length <= WRAP_WIDTH && !flat.includes("\n")) return flat;
 		const pad = "  ".repeat(indent + 1);
 		return `${open}\n${parts.map((p) => pad + p.replace(/\n/g, `\n${pad}`)).join(",\n")}\n${"  ".repeat(indent)}${close}`;
+	}
+
+	// Bytes and other numbers pack into rows rather than taking a line each.
+	function wrapPacked(open, parts, close, indent) {
+		const flat = `${open} ${parts.join(", ")} ${close}`;
+		if (flat.length <= WRAP_WIDTH) return flat;
+		const pad = "  ".repeat(indent + 1);
+		const rows = [];
+		let row = "";
+		for (const p of parts) {
+			if (row && pad.length + row.length + p.length + 2 > WRAP_WIDTH) {
+				rows.push(row);
+				row = "";
+			}
+			row += row ? ` ${p},` : `${p},`;
+		}
+		rows.push(row);
+		return `${open}\n${rows.map((r) => pad + r).join("\n").replace(/,$/, "")}\n${"  ".repeat(indent)}${close}`;
+	}
+
+	function more(total) {
+		return total > MAX_ITEMS ? [`... ${total - MAX_ITEMS} more item${total - MAX_ITEMS === 1 ? "" : "s"}`] : [];
 	}
 
 	function key(k) {
@@ -74,7 +101,8 @@
 		seen.add(value);
 		try {
 			if (Array.isArray(value)) {
-				const parts = value.map((v) => inspect(v, depth + 1, seen));
+				const parts = value.slice(0, MAX_ITEMS).map((v) => inspect(v, depth + 1, seen));
+				parts.push(...more(value.length));
 				// Trailing properties on an array are worth seeing; they are usually a bug.
 				for (const k of Object.keys(value)) {
 					if (!/^\d+$/.test(k)) parts.push(`${key(k)}: ${inspect(value[k], depth + 1, seen)}`);
@@ -82,8 +110,9 @@
 				return wrap("[", parts, "]", depth);
 			}
 			if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
-				const parts = Array.from(value, (v) => inspect(v, depth + 1, seen));
-				return `${value.constructor.name}(${value.length}) ${wrap("[", parts, "]", depth)}`;
+				const parts = Array.from(value.subarray(0, MAX_ITEMS), (v) => inspect(v, depth + 1, seen));
+				parts.push(...more(value.length));
+				return `${value.constructor.name}(${value.length}) ${wrapPacked("[", parts, "]", depth)}`;
 			}
 			if (value instanceof Map) {
 				const parts = [];
@@ -270,14 +299,48 @@
 	// stream (what HTTP calls "deflate" and what PNG and git objects hold), the
 	// Raw pair is the bare stream (what is inside a zip entry), and gzip/gunzip
 	// are .gz files. The level is zlib's 0–9, 6 by default.
-	globalThis.deflate = (data, level = 6) => raw.deflate(toBytes(data, "deflate"), level, true);
-	globalThis.deflateRaw = (data, level = 6) => raw.deflate(toBytes(data, "deflateRaw"), level, false);
-	globalThis.inflate = (data) => raw.inflate(toBytes(data, "inflate"), true)[0];
-	globalThis.inflateRaw = (data) => raw.inflate(toBytes(data, "inflateRaw"), false)[0];
+	//
+	// Two guards here are for habits carried over from Node. A string is never
+	// compressed data — it is almost always read() where readBytes() was meant,
+	// and read() has already mangled the bytes by decoding them — so the
+	// decompressors refuse one by name. And the level has to be a real 0–9,
+	// because a Node-style callback in its place would otherwise quietly become
+	// level 0 and never be called.
+	function compressedBytes(data, who) {
+		if (typeof data === "string") {
+			throw new TypeError(`${who}() needs bytes, not a string: read a compressed file with readBytes(path), not read(path)`);
+		}
+		return toBytes(data, who);
+	}
+
+	function checkLevel(level, who) {
+		if (!Number.isInteger(level) || level < 0 || level > 9) {
+			throw new RangeError(`${who}() level must be a whole number from 0 to 9 (there is no callback; it returns the result)`);
+		}
+		return level;
+	}
+
+	globalThis.deflate = (data, level = 6) =>
+		raw.deflate(toBytes(data, "deflate"), checkLevel(level, "deflate"), true);
+	globalThis.deflateRaw = (data, level = 6) =>
+		raw.deflate(toBytes(data, "deflateRaw"), checkLevel(level, "deflateRaw"), false);
+	globalThis.inflate = (data) => raw.inflate(compressedBytes(data, "inflate"), true)[0];
+	globalThis.inflateRaw = (data) => raw.inflate(compressedBytes(data, "inflateRaw"), false)[0];
+
+	// xz is decode-only: XZ Embedded has no compressor, and reading .xz is the
+	// case that comes up.
+	// The magic is checked here because XZ Embedded, handed something short that
+	// is not xz, waits for the rest of a header and then calls it truncated.
+	const XZ_MAGIC = [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00];
+	globalThis.unxz = function unxz(data) {
+		const b = compressedBytes(data, "unxz");
+		if (!XZ_MAGIC.every((v, i) => b[i] === v)) throw new Error("unxz(): not xz data");
+		return raw.unxz(b);
+	};
 
 	globalThis.gzip = function gzip(data, level = 6) {
 		const bytes = toBytes(data, "gzip");
-		const body = raw.deflate(bytes, level, false);
+		const body = raw.deflate(bytes, checkLevel(level, "gzip"), false);
 		const out = new Uint8Array(10 + body.length + 8);
 		// Magic, deflate, no flags, no mtime, no extra flags, OS "unknown".
 		out.set([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255]);
@@ -295,7 +358,7 @@
 	 * another member is ignored, the same as gzip's "trailing garbage".
 	 */
 	globalThis.gunzip = function gunzip(data) {
-		const b = toBytes(data, "gunzip");
+		const b = compressedBytes(data, "gunzip");
 		const parts = [];
 		let at = 0;
 		const truncated = () => new Error("gunzip(): data is truncated");

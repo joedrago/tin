@@ -5,8 +5,8 @@
 # compiles four engine sources and one of ours, and there is no target in the
 # build for quickjs-libc.c — the std/os bindings that would give a script
 # open(), exec() and getenv(). They are not disabled at runtime, they are not
-# in the binary. The one other vendored library, miniz in miniz/, is
-# compression and nothing else.
+# in the binary. The other two vendored libraries, miniz in miniz/ and
+# XZ Embedded in xz/, are compression and nothing else.
 
 cmake_minimum_required(VERSION 3.16)
 project(tinjs C)
@@ -102,9 +102,26 @@ add_library(miniz STATIC miniz/miniz.c)
 target_include_directories(miniz PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/miniz)
 target_compile_definitions(miniz PUBLIC MINIZ_NO_STDIO MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS)
 
+# XZ Embedded is the .xz decoder, and has no encoder or file code to leave out.
+# The switches are the ones its own userspace Makefile builds with: every BCJ
+# filter, every integrity check, and concatenated streams.
+add_library(xz STATIC
+    xz/xz_crc32.c
+    xz/xz_crc64.c
+    xz/xz_sha256.c
+    xz/xz_dec_stream.c
+    xz/xz_dec_lzma2.c
+    xz/xz_dec_bcj.c
+)
+target_include_directories(xz PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/xz)
+target_compile_definitions(xz PUBLIC
+    XZ_USE_CRC64 XZ_USE_SHA256 XZ_DEC_ANY_CHECK XZ_DEC_CONCATENATED
+    XZ_DEC_X86 XZ_DEC_ARM XZ_DEC_ARMTHUMB XZ_DEC_ARM64 XZ_DEC_RISCV
+    XZ_DEC_POWERPC XZ_DEC_IA64 XZ_DEC_SPARC)
+
 add_executable(tinjs src/tinjs.c src/digest.c)
 target_include_directories(tinjs PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
-target_link_libraries(tinjs PRIVATE quickjs miniz)
+target_link_libraries(tinjs PRIVATE quickjs miniz xz)
 if(WIN32)
     target_compile_definitions(tinjs PRIVATE WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0601)
 else()

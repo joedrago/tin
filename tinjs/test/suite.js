@@ -203,6 +203,7 @@ ok("lines is iterable more than once per call", typeof lines(`${fixtures}/log.tx
 
 // A gzipped file reads through lines() exactly as the plain one does.
 eq("lines inflates a .gz", [...lines(`${fixtures}/log.txt.gz`)], [...lines(`${fixtures}/log.txt`)]);
+eq("lines decompresses a .xz", [...lines(`${fixtures}/log.txt.xz`)], [...lines(`${fixtures}/log.txt`)]);
 
 // readdir and walk: the listing is sorted, so this is stable across filesystems.
 const listing = readdir(fixtures);
@@ -241,8 +242,24 @@ const twoMembers = new Uint8Array([...gzip("one "), ...gzip("two")]);
 eq("gunzip joins concatenated members", decodeText(gunzip(twoMembers)), "one two");
 eq("empty round trip", gunzip(gzip("")).length, 0);
 throws("inflate of garbage throws", () => inflate(new Uint8Array([1, 2, 3])));
-throws("gunzip of non-gzip throws", () => gunzip("plain text"));
+throws("gunzip of non-gzip throws", () => gunzip(new TextEncoder().encode("plain text")));
+for (const [name, fn] of [["gunzip", gunzip], ["inflate", inflate], ["inflateRaw", inflateRaw], ["unxz", unxz]]) {
+	let message = "";
+	try {
+		fn("a string");
+	} catch (e) {
+		message = e.message;
+	}
+	ok(`${name} of a string points at readBytes`, message.includes("readBytes"), message);
+}
+throws("a callback is not a level", () => gzip(text, () => {}));
+throws("a fractional level is refused", () => deflate(text, 4.5));
 throws("deflate level out of range throws", () => deflate(text, 11));
+eq("unxz reads real xz", decodeText(unxz(readBytes(`${fixtures}/log.txt.xz`))), read(`${fixtures}/log.txt`));
+throws("unxz of non-xz throws", () => unxz(new TextEncoder().encode("plain text")));
+const badXz = readBytes(`${fixtures}/log.txt.xz`);
+badXz[badXz.length - 30] ^= 1;
+throws("unxz notices corruption", () => unxz(badXz));
 const corrupt = gzip(text);
 corrupt[corrupt.length - 5] ^= 1;
 throws("gunzip notices a bad checksum", () => gunzip(corrupt));
@@ -274,6 +291,10 @@ ok("args is an array", Array.isArray(args));
 eq("inspect object", inspect({ a: 1, b: "x" }), `{ a: 1, b: 'x' }`);
 eq("inspect array", inspect([1, "two"]), `[ 1, 'two' ]`);
 eq("inspect nested", inspect({ m: new Map([["k", 1]]) }), `{ m: Map(1) { 'k' => 1 } }`);
+ok("inspect packs bytes into rows", inspect(new Uint8Array(30)).split("\n").length < 6);
+ok("inspect summarises a long typed array", /\.\.\. 900 more items\s*\]$/.test(inspect(new Uint8Array(1000))));
+ok("inspect summarises a long array", inspect(Array(250).fill(1)).includes("... 150 more items"));
+eq("inspect keeps a short typed array whole", inspect(new Uint8Array([1, 2, 3])), "Uint8Array(3) [ 1, 2, 3 ]");
 const cycle = { name: "loop" };
 cycle.self = cycle;
 ok("inspect handles cycles", inspect(cycle).includes("[Circular]"));

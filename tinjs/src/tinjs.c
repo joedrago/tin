@@ -11,8 +11,9 @@
  * On top of that this file adds a short, fixed list of hooks and stops: write to
  * stdout, write to stderr, read a file as text, read a file as bytes (whole or a
  * slice by offset and length), stat a path, list a directory, read a symlink,
- * walk a file a line at a time (gzipped or not), and exit. Beside those are a
- * few that only compute — deflate, inflate, checksums, hashes and UTF-8 — which
+ * walk a file a line at a time (gzipped, xz'd or plain), and exit. Beside those
+ * are a few that only compute — deflate, inflate, unxz, checksums, hashes and
+ * UTF-8 — which
  * take a buffer, return a buffer, and touch nothing else.
  *
  * There is deliberately no counterpart that creates or modifies a file,
@@ -34,6 +35,7 @@
 
 #include "quickjs.h"
 #include "miniz.h"
+#include "xz.h"
 #include "digest.h"
 
 #ifdef _WIN32
@@ -617,6 +619,70 @@ static JSValue js_inflate(JSContext *ctx, JSValueConst this_val, int argc, JSVal
 	return pair;
 }
 
+static const char *xz_error(enum xz_ret r);
+
+/*
+ * unxz(bytes): a whole .xz file's contents. Concatenated streams and stream
+ * padding are handled, and every block's integrity check — CRC-32, CRC-64 or
+ * SHA-256 — is verified. There is no compressing counterpart: XZ Embedded is a
+ * decoder only, and reading .xz is the case that comes up.
+ *
+ * The dictionary is not capped, but the output is held to TINJS_MAX_READ, the
+ * same as inflate().
+ */
+static JSValue js_unxz(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+	(void)this_val;
+	size_t len;
+	uint8_t *p = bytes_arg(ctx, argc > 0 ? argv[0] : JS_UNDEFINED, &len, "unxz");
+	if (!p) return JS_EXCEPTION;
+
+	struct xz_dec *dec = xz_dec_init(XZ_DYNALLOC, UINT32_MAX);
+	size_t cap = len * 4 > 4096 ? len * 4 : 4096;
+	if (cap > TINJS_MAX_READ) cap = TINJS_MAX_READ;
+	uint8_t *out = malloc(cap);
+	if (!dec || !out) {
+		if (dec) xz_dec_end(dec);
+		free(out);
+		return JS_ThrowOutOfMemory(ctx);
+	}
+
+	const char *err = NULL;
+	struct xz_buf b = {p, 0, len, out, 0, cap};
+	for (;;) {
+		enum xz_ret r = xz_dec_catrun(dec, &b, 1);
+		if (r == XZ_STREAM_END) break;
+		if (r != XZ_OK) {
+			err = xz_error(r);
+			break;
+		}
+		if (b.out_pos < b.out_size) continue; /* progress, and room for more */
+		if (cap >= TINJS_MAX_READ) {
+			err = "output is too large";
+			break;
+		}
+		size_t grown_cap = cap * 2 > TINJS_MAX_READ ? TINJS_MAX_READ : cap * 2;
+		uint8_t *grown = realloc(out, grown_cap);
+		if (!grown) {
+			err = "out of memory";
+			break;
+		}
+		out = grown;
+		cap = grown_cap;
+		b.out = out;
+		b.out_size = cap;
+	}
+	xz_dec_end(dec);
+
+	if (err) {
+		free(out);
+		return JS_ThrowInternalError(ctx, "unxz() failed: %s", err);
+	}
+	JSValue v = JS_NewUint8ArrayCopy(ctx, out, b.out_pos);
+	free(out);
+	return v;
+}
+
 /*
  * An open file being read one line at a time.
  *
@@ -635,23 +701,31 @@ static JSValue js_inflate(JSContext *ctx, JSValueConst this_val, int argc, JSVal
 #define TINJS_LINE_START ((size_t)4 << 10)
 
 /*
- * A gzip file being inflated on the way into the window.
+ * A compressed file being decompressed on the way into the window.
  *
- * A file that starts with gzip's magic bytes is read through this instead of
- * directly, so lines("access.log.1.gz") is the same loop as on the plain log.
- * `in` is compressed bytes from the file; `dict` is miniz's 32KB circular
- * history, which each step of output lands in before being copied to the
- * window. Concatenated members — which is what `cat a.gz b.gz` makes, and what
- * gzip itself reads as one file — are followed one after another, and each
- * member's CRC-32 and length are checked against its trailer.
+ * A file that starts with gzip's or xz's magic bytes is read through one of
+ * these instead of directly, so lines("access.log.1.gz") is the same loop as on
+ * the plain log. CompressedInput is the compressed bytes read from the file and
+ * not yet consumed, which both decoders draw from.
  */
-#define TINJS_GZ_IN ((size_t)64 << 10)
+#define TINJS_COMPRESSED_CHUNK ((size_t)64 << 10)
 
 typedef struct {
+	uint8_t data[TINJS_COMPRESSED_CHUNK];
+	size_t pos, len;
+	bool eof;
+	bool done; /* the decoder has said the data is over */
+} CompressedInput;
+
+/* gzip's own state. `dict` is miniz's 32KB circular history, which each step of
+ * output lands in before being copied to the window. Concatenated members —
+ * which is what `cat a.gz b.gz` makes, and what gzip itself reads as one file —
+ * are followed one after another, and each member's CRC-32 and length are
+ * checked against its trailer. xz needs nothing beyond its decoder handle:
+ * XZ Embedded keeps its dictionary itself, and follows concatenated streams and
+ * checks every integrity check on its own. */
+typedef struct {
 	tinfl_decompressor inf;
-	uint8_t in[TINJS_GZ_IN];
-	size_t in_pos, in_len;
-	bool in_eof;
 	uint8_t dict[TINFL_LZ_DICT_SIZE];
 	size_t dict_ofs;
 	mz_ulong crc;
@@ -661,7 +735,12 @@ typedef struct {
 
 typedef struct {
 	FILE *f; /* NULL once closed, which is also how end-of-file is remembered */
-	GzipStream *gz; /* NULL for a file that is not gzipped */
+
+	// Set only for a compressed file, and then exactly one of gz and xz.
+	CompressedInput *in;
+	GzipStream *gz;
+	struct xz_dec *xz;
+
 	char *line;
 	size_t line_cap;
 	char *chunk;
@@ -677,6 +756,12 @@ static void line_reader_close(LineReader *lr)
 		fclose(lr->f);
 		lr->f = NULL;
 	}
+	/* xz's dictionary can be tens of megabytes, so it goes when the file does
+	 * rather than waiting for the collector. */
+	if (lr->xz) {
+		xz_dec_end(lr->xz);
+		lr->xz = NULL;
+	}
 }
 
 static void line_reader_finalizer(JSRuntime *rt, JSValueConst val)
@@ -684,6 +769,7 @@ static void line_reader_finalizer(JSRuntime *rt, JSValueConst val)
 	LineReader *lr = JS_GetOpaque(val, tinjs_line_reader_class_id);
 	if (!lr) return;
 	line_reader_close(lr);
+	js_free_rt(rt, lr->in);
 	js_free_rt(rt, lr->gz);
 	js_free_rt(rt, lr->line);
 	js_free_rt(rt, lr->chunk);
@@ -724,23 +810,24 @@ static int line_reader_reserve(JSContext *ctx, LineReader *lr, size_t need, cons
 	return 0;
 }
 
-/* Move what is left of the input to the front and top it up from the file. */
-static int gz_refill(LineReader *lr, const char **err)
+/* Move what is left of the compressed input to the front and top it up from
+ * the file. */
+static int input_refill(LineReader *lr, const char **err)
 {
-	GzipStream *gz = lr->gz;
-	if (gz->in_eof) return 0;
-	size_t left = gz->in_len - gz->in_pos;
-	memmove(gz->in, gz->in + gz->in_pos, left);
-	gz->in_pos = 0;
-	gz->in_len = left;
-	size_t n = fread(gz->in + left, 1, TINJS_GZ_IN - left, lr->f);
-	gz->in_len += n;
+	CompressedInput *in = lr->in;
+	if (in->eof) return 0;
+	size_t left = in->len - in->pos;
+	memmove(in->data, in->data + in->pos, left);
+	in->pos = 0;
+	in->len = left;
+	size_t n = fread(in->data + left, 1, TINJS_COMPRESSED_CHUNK - left, lr->f);
+	in->len += n;
 	if (n == 0) {
 		if (ferror(lr->f)) {
 			*err = strerror(errno);
 			return -1;
 		}
-		gz->in_eof = true;
+		in->eof = true;
 	}
 	return 0;
 }
@@ -748,11 +835,11 @@ static int gz_refill(LineReader *lr, const char **err)
 /* One byte of input, or -1 at end of file (or on error, with *err set). */
 static int gz_byte(LineReader *lr, const char **err)
 {
-	GzipStream *gz = lr->gz;
-	if (gz->in_pos == gz->in_len) {
-		if (gz_refill(lr, err) != 0 || gz->in_pos == gz->in_len) return -1;
+	CompressedInput *in = lr->in;
+	if (in->pos == in->len) {
+		if (input_refill(lr, err) != 0 || in->pos == in->len) return -1;
 	}
-	return gz->in[gz->in_pos++];
+	return in->data[in->pos++];
 }
 
 /* Read a member header (RFC 1952, section 2.3). Returns 1 when a member starts,
@@ -808,19 +895,20 @@ truncated:
 static long gz_fill(LineReader *lr, const char **err)
 {
 	GzipStream *gz = lr->gz;
+	CompressedInput *in = lr->in;
 	for (;;) {
 		if (!gz->in_member) {
 			int r = gz_header(lr, err);
 			if (r <= 0) return r;
 		}
 
-		if (gz->in_pos == gz->in_len && gz_refill(lr, err) != 0) return -1;
-		size_t in_n = gz->in_len - gz->in_pos;
+		if (in->pos == in->len && input_refill(lr, err) != 0) return -1;
+		size_t in_n = in->len - in->pos;
 		size_t out_n = TINFL_LZ_DICT_SIZE - gz->dict_ofs;
-		int flags = gz->in_eof ? 0 : TINFL_FLAG_HAS_MORE_INPUT;
-		tinfl_status status = tinfl_decompress(&gz->inf, gz->in + gz->in_pos, &in_n, gz->dict,
+		int flags = in->eof ? 0 : TINFL_FLAG_HAS_MORE_INPUT;
+		tinfl_status status = tinfl_decompress(&gz->inf, in->data + in->pos, &in_n, gz->dict,
 		                                       gz->dict + gz->dict_ofs, &out_n, flags);
-		gz->in_pos += in_n;
+		in->pos += in_n;
 
 		if (out_n > 0) {
 			memcpy(lr->chunk, gz->dict + gz->dict_ofs, out_n);
@@ -846,11 +934,11 @@ static long gz_fill(LineReader *lr, const char **err)
 			}
 			gz->in_member = false;
 		} else if (status == TINFL_STATUS_NEEDS_MORE_INPUT) {
-			if (gz->in_eof) {
+			if (in->eof) {
 				*err = "gzip data is truncated";
 				return -1;
 			}
-			if (gz_refill(lr, err) != 0) return -1;
+			if (input_refill(lr, err) != 0) return -1;
 		} else if (status < 0) {
 			*err = status == TINFL_STATUS_FAILED_CANNOT_MAKE_PROGRESS ? "gzip data is truncated"
 			                                                          : "gzip data is corrupt";
@@ -861,10 +949,46 @@ static long gz_fill(LineReader *lr, const char **err)
 	}
 }
 
-/* Refill the window from the file, inflating on the way if it is gzipped. */
+/* xz's message for each way XZ Embedded can stop short. */
+static const char *xz_error(enum xz_ret r)
+{
+	switch (r) {
+	case XZ_MEM_ERROR: return "out of memory";
+	case XZ_FORMAT_ERROR: return "not xz data";
+	case XZ_OPTIONS_ERROR: return "xz data uses options this decoder does not support";
+	case XZ_DATA_ERROR: return "xz data is corrupt";
+	case XZ_BUF_ERROR: return "xz data is truncated";
+	default: return "xz decoding failed";
+	}
+}
+
+/* Fill the window with the next stretch of decompressed xz. Returns the count,
+ * 0 when the file is done, -1 on error. */
+static long xz_fill(LineReader *lr, const char **err)
+{
+	CompressedInput *in = lr->in;
+	if (in->done) return 0;
+	for (;;) {
+		if (in->pos == in->len && input_refill(lr, err) != 0) return -1;
+		struct xz_buf b = {in->data, in->pos, in->len, (uint8_t *)lr->chunk, 0, TINJS_LINE_CHUNK};
+		enum xz_ret r = xz_dec_catrun(lr->xz, &b, in->eof);
+		in->pos = b.in_pos;
+		if (r != XZ_OK && r != XZ_STREAM_END) {
+			*err = xz_error(r);
+			return -1;
+		}
+		/* STREAM_END can come with the last bytes still in hand: those are
+		 * handed over now, and the next call returns 0 without asking again. */
+		if (r == XZ_STREAM_END) in->done = true;
+		if (b.out_pos > 0 || in->done) return (long)b.out_pos;
+	}
+}
+
+/* Refill the window from the file, decompressing on the way if it is gzip or xz. */
 static long line_reader_fill(LineReader *lr, const char **err)
 {
 	if (lr->gz) return gz_fill(lr, err);
+	if (lr->xz) return xz_fill(lr, err);
 	size_t n = fread(lr->chunk, 1, TINJS_LINE_CHUNK, lr->f);
 	if (n == 0 && ferror(lr->f)) {
 		*err = strerror(errno);
@@ -932,55 +1056,59 @@ static JSValue js_open_lines(JSContext *ctx, JSValueConst this_val, int argc, JS
 	}
 	JS_FreeCString(ctx, path);
 
+	/* The object owns the reader from here on, so every failure below is just
+	 * dropping it: the finalizer closes and frees whatever got as far as being
+	 * set. */
 	LineReader *lr = js_mallocz(ctx, sizeof(*lr));
-	if (!lr) {
+	JSValue obj = lr ? JS_NewObjectClass(ctx, tinjs_line_reader_class_id) : JS_EXCEPTION;
+	if (JS_IsException(obj)) {
 		fclose(f);
-		return JS_EXCEPTION;
-	}
-	lr->chunk = js_malloc(ctx, TINJS_LINE_CHUNK);
-	lr->line = js_malloc(ctx, TINJS_LINE_START);
-	if (!lr->chunk || !lr->line) {
-		fclose(f);
-		js_free(ctx, lr->chunk);
-		js_free(ctx, lr->line);
 		js_free(ctx, lr);
 		return JS_EXCEPTION;
 	}
-	lr->line_cap = TINJS_LINE_START;
+	JS_SetOpaque(obj, lr);
 	lr->f = f;
 
-	/* Peek at the first window: gzip's magic bytes mean everything goes through
-	 * the inflater, and the bytes already read become its first input. */
+	lr->chunk = js_malloc(ctx, TINJS_LINE_CHUNK);
+	lr->line = js_malloc(ctx, TINJS_LINE_START);
+	if (!lr->chunk || !lr->line) goto fail;
+	lr->line_cap = TINJS_LINE_START;
+
+	/* Peek at the first window. gzip's or xz's magic bytes mean everything goes
+	 * through that decoder, and the bytes already read become its first input. */
 	lr->chunk_len = fread(lr->chunk, 1, TINJS_LINE_CHUNK, f);
-	if (lr->chunk_len >= 2 && (uint8_t)lr->chunk[0] == 0x1f && (uint8_t)lr->chunk[1] == 0x8b) {
-		lr->gz = js_mallocz(ctx, sizeof(*lr->gz));
-		if (!lr->gz) {
-			fclose(f);
-			js_free(ctx, lr->chunk);
-			js_free(ctx, lr->line);
-			js_free(ctx, lr);
-			return JS_EXCEPTION;
+	const uint8_t *head = (const uint8_t *)lr->chunk;
+	bool is_gz = lr->chunk_len >= 2 && head[0] == 0x1f && head[1] == 0x8b;
+	bool is_xz = lr->chunk_len >= 6 && !memcmp(head, "\xfd" "7zXZ\0", 6);
+	if (is_gz || is_xz) {
+		lr->in = js_mallocz(ctx, sizeof(*lr->in));
+		if (!lr->in) goto fail;
+		if (is_gz) {
+			lr->gz = js_mallocz(ctx, sizeof(*lr->gz));
+			if (!lr->gz) goto fail;
+		} else {
+			/* No cap on the dictionary: a file made with xz -9 wants 64MB of
+			 * it, and the format's own ceiling is 1.5GB. */
+			lr->xz = xz_dec_init(XZ_DYNALLOC, UINT32_MAX);
+			if (!lr->xz) {
+				JS_ThrowOutOfMemory(ctx);
+				goto fail;
+			}
 		}
 		/* The window is bigger than the input buffer, so the peek is split:
-		 * what fits goes to the inflater, and the file is rewound to just after
+		 * what fits goes to the decoder, and the file is rewound to just after
 		 * it so nothing is skipped. */
-		size_t take = lr->chunk_len < TINJS_GZ_IN ? lr->chunk_len : TINJS_GZ_IN;
-		memcpy(lr->gz->in, lr->chunk, take);
-		lr->gz->in_len = take;
+		size_t take = lr->chunk_len < TINJS_COMPRESSED_CHUNK ? lr->chunk_len : TINJS_COMPRESSED_CHUNK;
+		memcpy(lr->in->data, lr->chunk, take);
+		lr->in->len = take;
 		if (take < lr->chunk_len) fseek(f, (long)take, SEEK_SET);
 		lr->chunk_len = 0;
 	}
-
-	JSValue obj = JS_NewObjectClass(ctx, tinjs_line_reader_class_id);
-	if (JS_IsException(obj)) {
-		fclose(f);
-		js_free(ctx, lr->chunk);
-		js_free(ctx, lr->line);
-		js_free(ctx, lr);
-		return obj;
-	}
-	JS_SetOpaque(obj, lr);
 	return obj;
+
+fail:
+	JS_FreeValue(ctx, obj);
+	return JS_EXCEPTION;
 }
 
 static JSValue js_next_line(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
@@ -1085,6 +1213,7 @@ static int install_hooks(JSContext *ctx, int argc, char **argv)
 	JS_SetPropertyStr(ctx, tin, "utf8Decode", JS_NewCFunction(ctx, js_utf8_decode, "utf8Decode", 1));
 	JS_SetPropertyStr(ctx, tin, "deflate", JS_NewCFunction(ctx, js_deflate, "deflate", 3));
 	JS_SetPropertyStr(ctx, tin, "inflate", JS_NewCFunction(ctx, js_inflate, "inflate", 2));
+	JS_SetPropertyStr(ctx, tin, "unxz", JS_NewCFunction(ctx, js_unxz, "unxz", 1));
 
 	JSValue args = JS_NewArray(ctx);
 	for (int i = 0; i < argc; i++)
@@ -1205,9 +1334,10 @@ static void usage(FILE *out)
 	        "  readdir(path)      [{ name, isDirectory, isFile, isSymlink }], sorted\n"
 	        "  walk(path)         every entry below path, recursively, as { path, ... }\n"
 	        "  readlink(path)     where a symlink points\n"
-	        "  lines(path)        iterate the file a line at a time (.gz too)\n"
+	        "  lines(path)        iterate the file a line at a time (.gz and .xz too)\n"
 	        "  deflate/inflate, deflateRaw/inflateRaw, gzip/gunzip\n"
 	        "                     compress and decompress bytes or strings\n"
+	        "  unxz(data)         decompress .xz\n"
 	        "  crc32, adler32     checksums, as numbers\n"
 	        "  md5, sha1, sha256  hashes, as hex strings\n"
 	        "  TextEncoder, TextDecoder\n"
@@ -1339,6 +1469,10 @@ int main(int argc, char **argv)
 	JS_SetHostPromiseRejectionTracker(rt, on_promise_rejection, &rejection);
 	JS_SetMaxStackSize(rt, TINJS_STACK_BYTES);
 	if (memory_mb > 0) JS_SetMemoryLimit(rt, (size_t)memory_mb << 20);
+
+	/* XZ Embedded's CRC tables, which it wants built before any decoding. */
+	xz_crc32_init();
+	xz_crc64_init();
 
 	JS_NewClassID(rt, &tinjs_line_reader_class_id);
 	if (JS_NewClass(rt, tinjs_line_reader_class_id, &tinjs_line_reader_class) < 0) {
