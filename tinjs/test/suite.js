@@ -201,6 +201,69 @@ eq("break leaves the loop", firstOnly, "first");
 eq("and the file can be walked again", [...lines(`${fixtures}/crlf.txt`)].length, 4);
 ok("lines is iterable more than once per call", typeof lines(`${fixtures}/log.txt`)[Symbol.iterator] === "function");
 
+// A gzipped file reads through lines() exactly as the plain one does.
+eq("lines inflates a .gz", [...lines(`${fixtures}/log.txt.gz`)], [...lines(`${fixtures}/log.txt`)]);
+
+// readdir and walk: the listing is sorted, so this is stable across filesystems.
+const listing = readdir(fixtures);
+ok("readdir lists the fixtures", listing.some((e) => e.name === "log.txt" && e.isFile && !e.isDirectory));
+eq("readdir is sorted", listing.map((e) => e.name), listing.map((e) => e.name).sort());
+ok("readdir has no . or ..", !listing.some((e) => e.name === "." || e.name === ".."));
+throws("readdir of a missing directory throws", () => readdir(`${fixtures}/nope-does-not-exist`));
+throws("readdir of a file throws", () => readdir(`${fixtures}/log.txt`));
+const walked = [...walk(`${fixtures}/..`)];
+ok("walk descends", walked.some((e) => e.path.endsWith("/fixtures/log.txt")));
+ok("walk gives directories too", walked.some((e) => e.path.endsWith("/fixtures") && e.isDirectory));
+eq("stat isSymlink on a plain file", stat(`${fixtures}/log.txt`).isSymlink, false);
+
+// Hashes and checksums, against the standard test vectors.
+eq("md5", md5("abc"), "900150983cd24fb0d6963f7d28e17f72");
+eq("sha1", sha1("abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+eq("sha256", sha256("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+eq("sha256 of nothing", sha256(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+eq("sha256 across a block boundary", sha256("a".repeat(1000)), "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3");
+eq("hash of bytes matches hash of string", sha1(new Uint8Array([97, 98, 99])), sha1("abc"));
+eq("hash of a subarray sees only the view", md5(new Uint8Array([0, 97, 98, 99, 0]).subarray(1, 4)), md5("abc"));
+eq("crc32", crc32("The quick brown fox jumps over the lazy dog"), 0x414fa339);
+eq("adler32", adler32("Wikipedia"), 0x11e60398);
+throws("hash of a number throws", () => md5(5));
+
+// Compression: each pair round-trips, and gunzip reads what the real gzip wrote.
+const text = "the quick brown fox ".repeat(100);
+const decodeText = (b) => new TextDecoder().decode(b);
+eq("deflate/inflate round trip", decodeText(inflate(deflate(text))), text);
+eq("deflateRaw/inflateRaw round trip", decodeText(inflateRaw(deflateRaw(text, 9))), text);
+eq("gzip/gunzip round trip", decodeText(gunzip(gzip(text))), text);
+ok("deflate compresses", deflate(text).length < text.length / 10);
+eq("deflate wears a zlib header", deflate(text)[0], 0x78);
+eq("gunzip reads real gzip", decodeText(gunzip(readBytes(`${fixtures}/log.txt.gz`))), read(`${fixtures}/log.txt`));
+const twoMembers = new Uint8Array([...gzip("one "), ...gzip("two")]);
+eq("gunzip joins concatenated members", decodeText(gunzip(twoMembers)), "one two");
+eq("empty round trip", gunzip(gzip("")).length, 0);
+throws("inflate of garbage throws", () => inflate(new Uint8Array([1, 2, 3])));
+throws("gunzip of non-gzip throws", () => gunzip("plain text"));
+throws("deflate level out of range throws", () => deflate(text, 11));
+const corrupt = gzip(text);
+corrupt[corrupt.length - 5] ^= 1;
+throws("gunzip notices a bad checksum", () => gunzip(corrupt));
+
+// TextEncoder and TextDecoder.
+eq("TextEncoder", Array.from(new TextEncoder().encode("é")), [0xc3, 0xa9]);
+eq("TextEncoder replaces a lone surrogate", Array.from(new TextEncoder().encode("\ud800")), [0xef, 0xbf, 0xbd]);
+eq("TextDecoder utf-8", new TextDecoder().decode(new Uint8Array([0x68, 0xc3, 0xa9])), "hé");
+eq("TextDecoder drops a BOM", new TextDecoder().decode(new Uint8Array([0xef, 0xbb, 0xbf, 0x68])), "h");
+eq("TextDecoder ignoreBOM keeps it", new TextDecoder("utf-8", { ignoreBOM: true }).decode(new Uint8Array([0xef, 0xbb, 0xbf])), "﻿");
+eq("TextDecoder replaces bad bytes", new TextDecoder().decode(new Uint8Array([0x68, 0xff])), "h�");
+throws("TextDecoder fatal throws on bad bytes", () => new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array([0xff])));
+throws("TextDecoder fatal throws on an encoded surrogate", () =>
+	new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array([0xed, 0xa0, 0x80])),
+);
+eq("TextDecoder utf-16le", new TextDecoder("utf-16le").decode(new Uint8Array([0xff, 0xfe, 0x68, 0, 0x3d, 0xd8, 0x42, 0xde])), "h🙂");
+eq("TextDecoder utf-16be", new TextDecoder("utf-16be").decode(new Uint8Array([0, 0x68, 0, 0x69])), "hi");
+eq("TextDecoder latin1 is windows-1252", new TextDecoder("latin1").decode(new Uint8Array([0xe9, 0x80])), "é€");
+eq("TextDecoder of nothing", new TextDecoder().decode(), "");
+throws("TextDecoder refuses an unknown encoding", () => new TextDecoder("klingon"));
+
 // readStdin is gone. Under tin stdin is always closed, so it could only ever
 // return "" — a binding that cannot work is worse than no binding at all.
 ok("no readStdin", typeof globalThis.readStdin === "undefined");

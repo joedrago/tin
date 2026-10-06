@@ -5,7 +5,8 @@
 # compiles four engine sources and one of ours, and there is no target in the
 # build for quickjs-libc.c — the std/os bindings that would give a script
 # open(), exec() and getenv(). They are not disabled at runtime, they are not
-# in the binary.
+# in the binary. The one other vendored library, miniz in miniz/, is
+# compression and nothing else.
 
 cmake_minimum_required(VERSION 3.16)
 project(tinjs C)
@@ -94,9 +95,16 @@ if(CMAKE_DL_LIBS)
     target_link_libraries(quickjs PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
-add_executable(tinjs src/tinjs.c)
+# miniz is deflate, inflate and the two checksums. The switches leave out its
+# stdio helpers and its zip-archive code, which is the only part of it that
+# opens or writes a path; what remains works on buffers and nothing else.
+add_library(miniz STATIC miniz/miniz.c)
+target_include_directories(miniz PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/miniz)
+target_compile_definitions(miniz PUBLIC MINIZ_NO_STDIO MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS)
+
+add_executable(tinjs src/tinjs.c src/digest.c)
 target_include_directories(tinjs PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
-target_link_libraries(tinjs PRIVATE quickjs)
+target_link_libraries(tinjs PRIVATE quickjs miniz)
 if(WIN32)
     target_compile_definitions(tinjs PRIVATE WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0601)
 else()

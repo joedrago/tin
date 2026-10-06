@@ -10,8 +10,12 @@
  *
  * On top of that this file adds a short, fixed list of hooks and stops: write to
  * stdout, write to stderr, read a file as text, read a file as bytes (whole or a
- * slice by offset and length), stat a path, walk a file a line at a time, and
- * exit. There is deliberately no counterpart that creates or modifies a file,
+ * slice by offset and length), stat a path, list a directory, read a symlink,
+ * walk a file a line at a time (gzipped or not), and exit. Beside those are a
+ * few that only compute — deflate, inflate, checksums, hashes and UTF-8 — which
+ * take a buffer, return a buffer, and touch nothing else.
+ *
+ * There is deliberately no counterpart that creates or modifies a file,
  * opens a socket, starts a process or reads the environment — and none can be
  * reached by another route, because there is no other route to reach. stdout is
  * the only way data leaves a tinjs run.
@@ -29,12 +33,15 @@
 #include <sys/stat.h>
 
 #include "quickjs.h"
+#include "miniz.h"
+#include "digest.h"
 
 #ifdef _WIN32
 #	include <windows.h>
 #	include <fcntl.h>
 #	include <io.h>
 #else
+#	include <dirent.h>
 #	include <time.h>
 #	include <unistd.h>
 #endif
@@ -308,6 +315,19 @@ typedef struct stat tinjs_stat_t;
 #	define tinjs_stat stat
 #endif
 
+/* Whether the path itself is a symlink, as opposed to what it points at. On
+ * Windows any reparse point counts, which takes in junctions as well. */
+static bool is_symlink(const char *path)
+{
+#ifdef _WIN32
+	DWORD attrs = GetFileAttributesA(path);
+	return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT);
+#else
+	struct stat st;
+	return lstat(path, &st) == 0 && S_ISLNK(st.st_mode);
+#endif
+}
+
 static JSValue js_stat(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 {
 	(void)this_val;
@@ -322,6 +342,7 @@ static JSValue js_stat(JSContext *ctx, JSValueConst this_val, int argc, JSValueC
 		JS_FreeCString(ctx, path);
 		return JS_EXCEPTION;
 	}
+	bool link = is_symlink(path);
 	JS_FreeCString(ctx, path);
 
 	JSValue out = JS_NewObject(ctx);
@@ -329,7 +350,271 @@ static JSValue js_stat(JSContext *ctx, JSValueConst this_val, int argc, JSValueC
 	JS_SetPropertyStr(ctx, out, "mtimeMs", JS_NewFloat64(ctx, (double)st.st_mtime * 1000.0));
 	JS_SetPropertyStr(ctx, out, "isDirectory", JS_NewBool(ctx, S_ISDIR(st.st_mode)));
 	JS_SetPropertyStr(ctx, out, "isFile", JS_NewBool(ctx, S_ISREG(st.st_mode)));
+	JS_SetPropertyStr(ctx, out, "isSymlink", JS_NewBool(ctx, link));
 	return out;
+}
+
+/* One directory entry as readdir() hands it back: its name, and the same three
+ * kind flags stat() gives, so a script walking a tree does not have to stat
+ * every entry a second time to know whether to descend. isFile and isDirectory
+ * describe what a link points at; a link that points at nothing is neither. */
+static JSValue dir_entry(JSContext *ctx, const char *dir, const char *name)
+{
+	size_t dlen = strlen(dir), nlen = strlen(name);
+	char *full = malloc(dlen + nlen + 2);
+	if (!full) return JS_ThrowOutOfMemory(ctx);
+	memcpy(full, dir, dlen);
+	full[dlen] = '/';
+	memcpy(full + dlen + 1, name, nlen + 1);
+
+	tinjs_stat_t st;
+	bool ok = tinjs_stat(full, &st) == 0;
+	bool link = is_symlink(full);
+	free(full);
+
+	JSValue e = JS_NewObject(ctx);
+	JS_SetPropertyStr(ctx, e, "name", JS_NewString(ctx, name));
+	JS_SetPropertyStr(ctx, e, "isDirectory", JS_NewBool(ctx, ok && S_ISDIR(st.st_mode)));
+	JS_SetPropertyStr(ctx, e, "isFile", JS_NewBool(ctx, ok && S_ISREG(st.st_mode)));
+	JS_SetPropertyStr(ctx, e, "isSymlink", JS_NewBool(ctx, link));
+	return e;
+}
+
+/* The entries of one directory, minus "." and "..", in whatever order the
+ * filesystem gives them; prelude.js sorts them. */
+static JSValue js_readdir(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+	(void)this_val;
+	if (argc < 1) return JS_ThrowTypeError(ctx, "readdir() needs a path");
+
+	const char *path = JS_ToCString(ctx, argv[0]);
+	if (!path) return JS_EXCEPTION;
+
+	JSValue out = JS_NewArray(ctx);
+	uint32_t n = 0;
+
+#ifdef _WIN32
+	size_t plen = strlen(path);
+	char *pattern = malloc(plen + 3);
+	if (!pattern) {
+		JS_FreeCString(ctx, path);
+		JS_FreeValue(ctx, out);
+		return JS_ThrowOutOfMemory(ctx);
+	}
+	memcpy(pattern, path, plen);
+	memcpy(pattern + plen, "\\*", 3);
+	WIN32_FIND_DATAA fd;
+	HANDLE h = FindFirstFileA(pattern, &fd);
+	free(pattern);
+	if (h == INVALID_HANDLE_VALUE) {
+		JS_ThrowInternalError(ctx, "cannot list %s: error %lu", path, (unsigned long)GetLastError());
+		JS_FreeCString(ctx, path);
+		JS_FreeValue(ctx, out);
+		return JS_EXCEPTION;
+	}
+	do {
+		if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+		JS_SetPropertyUint32(ctx, out, n++, dir_entry(ctx, path, fd.cFileName));
+	} while (FindNextFileA(h, &fd));
+	FindClose(h);
+#else
+	DIR *d = opendir(path);
+	if (!d) {
+		JS_ThrowInternalError(ctx, "cannot list %s: %s", path, strerror(errno));
+		JS_FreeCString(ctx, path);
+		JS_FreeValue(ctx, out);
+		return JS_EXCEPTION;
+	}
+	struct dirent *ent;
+	while ((ent = readdir(d)) != NULL) {
+		if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+		JS_SetPropertyUint32(ctx, out, n++, dir_entry(ctx, path, ent->d_name));
+	}
+	closedir(d);
+#endif
+
+	JS_FreeCString(ctx, path);
+	return out;
+}
+
+/* Where a symlink points, as written in the link — not resolved, and possibly
+ * relative to the directory the link is in. */
+static JSValue js_readlink(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+	(void)this_val;
+	if (argc < 1) return JS_ThrowTypeError(ctx, "readlink() needs a path");
+
+#ifdef _WIN32
+	return JS_ThrowInternalError(ctx, "readlink() is not supported on Windows");
+#else
+	const char *path = JS_ToCString(ctx, argv[0]);
+	if (!path) return JS_EXCEPTION;
+
+	char buf[4096];
+	ssize_t len = readlink(path, buf, sizeof(buf));
+	if (len < 0) {
+		JS_ThrowInternalError(ctx, "cannot readlink %s: %s", path, strerror(errno));
+		JS_FreeCString(ctx, path);
+		return JS_EXCEPTION;
+	}
+	JS_FreeCString(ctx, path);
+	if ((size_t)len == sizeof(buf)) return JS_ThrowInternalError(ctx, "symlink target is too long");
+	return JS_NewStringLen(ctx, buf, (size_t)len);
+#endif
+}
+
+/* ------------------------------------------------------------- pure functions
+ *
+ * Everything from here to the line reader takes a Uint8Array (or a string) and
+ * returns a new value computed from it. None of it opens, names or touches
+ * anything outside the buffers it is handed. prelude.js turns strings and other
+ * views into a Uint8Array before calling, so these only have to accept one. */
+
+static uint8_t *bytes_arg(JSContext *ctx, JSValueConst v, size_t *len, const char *who)
+{
+	uint8_t *p = JS_GetUint8Array(ctx, len, v);
+	if (!p) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		JS_ThrowTypeError(ctx, "%s() needs a Uint8Array", who);
+	}
+	return p;
+}
+
+/* magic: 0 MD5, 1 SHA-1, 2 SHA-256. The result is lowercase hex. */
+static JSValue js_digest(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic)
+{
+	static const char *names[] = {"md5", "sha1", "sha256"};
+	(void)this_val;
+	size_t len;
+	uint8_t *p = bytes_arg(ctx, argc > 0 ? argv[0] : JS_UNDEFINED, &len, names[magic]);
+	if (!p) return JS_EXCEPTION;
+
+	char hex[65];
+	if (magic == 0) digest_md5(p, len, hex);
+	else if (magic == 1) digest_sha1(p, len, hex);
+	else digest_sha256(p, len, hex);
+	return JS_NewString(ctx, hex);
+}
+
+/* magic: 0 CRC-32, 1 Adler-32. */
+static JSValue js_checksum(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic)
+{
+	(void)this_val;
+	size_t len;
+	uint8_t *p = bytes_arg(ctx, argc > 0 ? argv[0] : JS_UNDEFINED, &len, magic ? "adler32" : "crc32");
+	if (!p) return JS_EXCEPTION;
+	mz_ulong sum = magic ? mz_adler32(MZ_ADLER32_INIT, p, len) : mz_crc32(MZ_CRC32_INIT, p, len);
+	return JS_NewInt64(ctx, (int64_t)(uint32_t)sum);
+}
+
+static JSValue js_utf8_encode(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+	(void)this_val;
+	size_t len;
+	const char *s = JS_ToCStringLen(ctx, &len, argc > 0 ? argv[0] : JS_UNDEFINED);
+	if (!s) return JS_EXCEPTION;
+	JSValue out = JS_NewUint8ArrayCopy(ctx, (const uint8_t *)s, len);
+	JS_FreeCString(ctx, s);
+	return out;
+}
+
+static JSValue js_utf8_decode(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+	(void)this_val;
+	size_t len;
+	uint8_t *p = bytes_arg(ctx, argc > 0 ? argv[0] : JS_UNDEFINED, &len, "decode");
+	if (!p) return JS_EXCEPTION;
+	return JS_NewStringLen(ctx, (const char *)p, len);
+}
+
+/* deflate(bytes, level, zlib): a raw deflate stream, or with zlib set the same
+ * stream inside a zlib header and Adler-32 trailer. gzip's wrapper is built in
+ * prelude.js out of this and crc32. */
+static JSValue js_deflate(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+	(void)this_val;
+	size_t len;
+	uint8_t *p = bytes_arg(ctx, argc > 0 ? argv[0] : JS_UNDEFINED, &len, "deflate");
+	if (!p) return JS_EXCEPTION;
+
+	int32_t level = MZ_DEFAULT_LEVEL;
+	if (argc > 1 && JS_ToInt32(ctx, &level, argv[1])) return JS_EXCEPTION;
+	if (level < 0 || level > 9) return JS_ThrowRangeError(ctx, "deflate() level must be 0 to 9");
+	bool zlib = argc > 2 && JS_ToBool(ctx, argv[2]);
+
+	int flags = (int)tdefl_create_comp_flags_from_zip_params(level, zlib ? 15 : -15, MZ_DEFAULT_STRATEGY);
+	size_t out_len = 0;
+	void *out = tdefl_compress_mem_to_heap(p, len, &out_len, flags);
+	if (!out) return JS_ThrowInternalError(ctx, "deflate() failed");
+	JSValue v = JS_NewUint8ArrayCopy(ctx, out, out_len);
+	mz_free(out);
+	return v;
+}
+
+/*
+ * inflate(bytes, zlib): the inverse, returning [output, bytes consumed].
+ *
+ * The consumed count is what lets gunzip in prelude.js find the trailer after
+ * the stream and the next member after that. The output grows by doubling and
+ * stops at TINJS_MAX_READ, the same ceiling read() has, so a small file that
+ * claims to expand to terabytes is an error rather than an allocation.
+ */
+static JSValue js_inflate(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+	(void)this_val;
+	size_t len;
+	uint8_t *p = bytes_arg(ctx, argc > 0 ? argv[0] : JS_UNDEFINED, &len, "inflate");
+	if (!p) return JS_EXCEPTION;
+	bool zlib = argc > 1 && JS_ToBool(ctx, argv[1]);
+
+	tinfl_decompressor *inf = malloc(sizeof(*inf));
+	size_t cap = len * 4 > 4096 ? len * 4 : 4096;
+	if (cap > TINJS_MAX_READ) cap = TINJS_MAX_READ;
+	uint8_t *out = malloc(cap);
+	if (!inf || !out) {
+		free(inf);
+		free(out);
+		return JS_ThrowOutOfMemory(ctx);
+	}
+	tinfl_init(inf);
+
+	const char *err = NULL;
+	size_t in_pos = 0, out_len = 0;
+	int flags = TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF | (zlib ? TINFL_FLAG_PARSE_ZLIB_HEADER : 0);
+	for (;;) {
+		size_t in_n = len - in_pos, out_n = cap - out_len;
+		tinfl_status status = tinfl_decompress(inf, p + in_pos, &in_n, out, out + out_len, &out_n, flags);
+		in_pos += in_n;
+		out_len += out_n;
+		if (status == TINFL_STATUS_DONE) break;
+		if (status != TINFL_STATUS_HAS_MORE_OUTPUT) {
+			err = status == TINFL_STATUS_ADLER32_MISMATCH ? "checksum mismatch" : "data is corrupt or truncated";
+			break;
+		}
+		if (cap >= TINJS_MAX_READ) {
+			err = "output is too large";
+			break;
+		}
+		size_t grown_cap = cap * 2 > TINJS_MAX_READ ? TINJS_MAX_READ : cap * 2;
+		uint8_t *grown = realloc(out, grown_cap);
+		if (!grown) {
+			err = "out of memory";
+			break;
+		}
+		out = grown;
+		cap = grown_cap;
+	}
+	free(inf);
+
+	if (err) {
+		free(out);
+		return JS_ThrowInternalError(ctx, "inflate() failed: %s", err);
+	}
+	JSValue pair = JS_NewArray(ctx);
+	JS_SetPropertyUint32(ctx, pair, 0, JS_NewUint8ArrayCopy(ctx, out, out_len));
+	JS_SetPropertyUint32(ctx, pair, 1, JS_NewInt64(ctx, (int64_t)in_pos));
+	free(out);
+	return pair;
 }
 
 /*
@@ -349,8 +634,34 @@ static JSValue js_stat(JSContext *ctx, JSValueConst this_val, int argc, JSValueC
 #define TINJS_LINE_CHUNK ((size_t)64 << 10)
 #define TINJS_LINE_START ((size_t)4 << 10)
 
+/*
+ * A gzip file being inflated on the way into the window.
+ *
+ * A file that starts with gzip's magic bytes is read through this instead of
+ * directly, so lines("access.log.1.gz") is the same loop as on the plain log.
+ * `in` is compressed bytes from the file; `dict` is miniz's 32KB circular
+ * history, which each step of output lands in before being copied to the
+ * window. Concatenated members — which is what `cat a.gz b.gz` makes, and what
+ * gzip itself reads as one file — are followed one after another, and each
+ * member's CRC-32 and length are checked against its trailer.
+ */
+#define TINJS_GZ_IN ((size_t)64 << 10)
+
+typedef struct {
+	tinfl_decompressor inf;
+	uint8_t in[TINJS_GZ_IN];
+	size_t in_pos, in_len;
+	bool in_eof;
+	uint8_t dict[TINFL_LZ_DICT_SIZE];
+	size_t dict_ofs;
+	mz_ulong crc;
+	uint32_t size;
+	bool in_member; /* false between members, where a header is expected next */
+} GzipStream;
+
 typedef struct {
 	FILE *f; /* NULL once closed, which is also how end-of-file is remembered */
+	GzipStream *gz; /* NULL for a file that is not gzipped */
 	char *line;
 	size_t line_cap;
 	char *chunk;
@@ -373,6 +684,7 @@ static void line_reader_finalizer(JSRuntime *rt, JSValueConst val)
 	LineReader *lr = JS_GetOpaque(val, tinjs_line_reader_class_id);
 	if (!lr) return;
 	line_reader_close(lr);
+	js_free_rt(rt, lr->gz);
 	js_free_rt(rt, lr->line);
 	js_free_rt(rt, lr->chunk);
 	js_free_rt(rt, lr);
@@ -412,6 +724,155 @@ static int line_reader_reserve(JSContext *ctx, LineReader *lr, size_t need, cons
 	return 0;
 }
 
+/* Move what is left of the input to the front and top it up from the file. */
+static int gz_refill(LineReader *lr, const char **err)
+{
+	GzipStream *gz = lr->gz;
+	if (gz->in_eof) return 0;
+	size_t left = gz->in_len - gz->in_pos;
+	memmove(gz->in, gz->in + gz->in_pos, left);
+	gz->in_pos = 0;
+	gz->in_len = left;
+	size_t n = fread(gz->in + left, 1, TINJS_GZ_IN - left, lr->f);
+	gz->in_len += n;
+	if (n == 0) {
+		if (ferror(lr->f)) {
+			*err = strerror(errno);
+			return -1;
+		}
+		gz->in_eof = true;
+	}
+	return 0;
+}
+
+/* One byte of input, or -1 at end of file (or on error, with *err set). */
+static int gz_byte(LineReader *lr, const char **err)
+{
+	GzipStream *gz = lr->gz;
+	if (gz->in_pos == gz->in_len) {
+		if (gz_refill(lr, err) != 0 || gz->in_pos == gz->in_len) return -1;
+	}
+	return gz->in[gz->in_pos++];
+}
+
+/* Read a member header (RFC 1952, section 2.3). Returns 1 when a member starts,
+ * 0 when the file is over, -1 on error. Anything after the last member that is
+ * not another header is ignored, the way gzip -d treats trailing garbage. */
+static int gz_header(LineReader *lr, const char **err)
+{
+	int b0 = gz_byte(lr, err);
+	if (b0 < 0) return *err ? -1 : 0;
+	int b1 = gz_byte(lr, err);
+	if (b0 != 0x1f || b1 != 0x8b) return *err ? -1 : 0;
+
+	int fixed[8];
+	for (int i = 0; i < 8; i++) fixed[i] = gz_byte(lr, err);
+	int method = fixed[0], flags = fixed[1];
+	if (fixed[7] < 0) goto truncated;
+	if (method != 8) {
+		*err = "not a deflate gzip member";
+		return -1;
+	}
+	if (flags & 4) { /* FEXTRA */
+		int lo = gz_byte(lr, err), hi = gz_byte(lr, err);
+		if (hi < 0) goto truncated;
+		for (int n = lo | hi << 8; n > 0; n--)
+			if (gz_byte(lr, err) < 0) goto truncated;
+	}
+	for (int bit = 8; bit <= 16; bit <<= 1) { /* FNAME, then FCOMMENT */
+		if (!(flags & bit)) continue;
+		int c;
+		while ((c = gz_byte(lr, err)) > 0) {}
+		if (c < 0) goto truncated;
+	}
+	if (flags & 2) { /* FHCRC */
+		gz_byte(lr, err);
+		if (gz_byte(lr, err) < 0) goto truncated;
+	}
+
+	GzipStream *gz = lr->gz;
+	tinfl_init(&gz->inf);
+	gz->dict_ofs = 0;
+	gz->crc = MZ_CRC32_INIT;
+	gz->size = 0;
+	gz->in_member = true;
+	return 1;
+
+truncated:
+	if (!*err) *err = "gzip data is truncated";
+	return -1;
+}
+
+/* Fill the window with the next stretch of inflated bytes. Returns the count,
+ * 0 when every member is done, -1 on error. */
+static long gz_fill(LineReader *lr, const char **err)
+{
+	GzipStream *gz = lr->gz;
+	for (;;) {
+		if (!gz->in_member) {
+			int r = gz_header(lr, err);
+			if (r <= 0) return r;
+		}
+
+		if (gz->in_pos == gz->in_len && gz_refill(lr, err) != 0) return -1;
+		size_t in_n = gz->in_len - gz->in_pos;
+		size_t out_n = TINFL_LZ_DICT_SIZE - gz->dict_ofs;
+		int flags = gz->in_eof ? 0 : TINFL_FLAG_HAS_MORE_INPUT;
+		tinfl_status status = tinfl_decompress(&gz->inf, gz->in + gz->in_pos, &in_n, gz->dict,
+		                                       gz->dict + gz->dict_ofs, &out_n, flags);
+		gz->in_pos += in_n;
+
+		if (out_n > 0) {
+			memcpy(lr->chunk, gz->dict + gz->dict_ofs, out_n);
+			gz->crc = mz_crc32(gz->crc, gz->dict + gz->dict_ofs, out_n);
+			gz->size += (uint32_t)out_n;
+			gz->dict_ofs = (gz->dict_ofs + out_n) & (TINFL_LZ_DICT_SIZE - 1);
+		}
+
+		if (status == TINFL_STATUS_DONE) {
+			uint32_t want_crc = 0, want_size = 0;
+			for (int i = 0; i < 8; i++) {
+				int b = gz_byte(lr, err);
+				if (b < 0) {
+					if (!*err) *err = "gzip data is truncated";
+					return -1;
+				}
+				if (i < 4) want_crc |= (uint32_t)b << (8 * i);
+				else want_size |= (uint32_t)b << (8 * (i - 4));
+			}
+			if (want_crc != (uint32_t)gz->crc || want_size != gz->size) {
+				*err = "gzip checksum mismatch";
+				return -1;
+			}
+			gz->in_member = false;
+		} else if (status == TINFL_STATUS_NEEDS_MORE_INPUT) {
+			if (gz->in_eof) {
+				*err = "gzip data is truncated";
+				return -1;
+			}
+			if (gz_refill(lr, err) != 0) return -1;
+		} else if (status < 0) {
+			*err = status == TINFL_STATUS_FAILED_CANNOT_MAKE_PROGRESS ? "gzip data is truncated"
+			                                                          : "gzip data is corrupt";
+			return -1;
+		}
+
+		if (out_n > 0) return (long)out_n;
+	}
+}
+
+/* Refill the window from the file, inflating on the way if it is gzipped. */
+static long line_reader_fill(LineReader *lr, const char **err)
+{
+	if (lr->gz) return gz_fill(lr, err);
+	size_t n = fread(lr->chunk, 1, TINJS_LINE_CHUNK, lr->f);
+	if (n == 0 && ferror(lr->f)) {
+		*err = strerror(errno);
+		return -1;
+	}
+	return (long)n;
+}
+
 /* Read one line into lr->line, without its terminator. Returns 1 on a line, 0 at
  * end of file, -1 on error with *err set. */
 static int line_reader_next(JSContext *ctx, LineReader *lr, size_t *out_len, const char **err)
@@ -422,13 +883,11 @@ static int line_reader_next(JSContext *ctx, LineReader *lr, size_t *out_len, con
 
 	for (;;) {
 		if (lr->chunk_pos == lr->chunk_len) {
-			lr->chunk_len = fread(lr->chunk, 1, TINJS_LINE_CHUNK, lr->f);
+			long n = line_reader_fill(lr, err);
+			if (n < 0) return -1;
+			lr->chunk_len = (size_t)n;
 			lr->chunk_pos = 0;
 			if (lr->chunk_len == 0) {
-				if (ferror(lr->f)) {
-					*err = strerror(errno);
-					return -1;
-				}
 				/* A last line with no newline after it is still a line. */
 				line_reader_close(lr);
 				if (len == 0) return 0;
@@ -489,6 +948,28 @@ static JSValue js_open_lines(JSContext *ctx, JSValueConst this_val, int argc, JS
 	}
 	lr->line_cap = TINJS_LINE_START;
 	lr->f = f;
+
+	/* Peek at the first window: gzip's magic bytes mean everything goes through
+	 * the inflater, and the bytes already read become its first input. */
+	lr->chunk_len = fread(lr->chunk, 1, TINJS_LINE_CHUNK, f);
+	if (lr->chunk_len >= 2 && (uint8_t)lr->chunk[0] == 0x1f && (uint8_t)lr->chunk[1] == 0x8b) {
+		lr->gz = js_mallocz(ctx, sizeof(*lr->gz));
+		if (!lr->gz) {
+			fclose(f);
+			js_free(ctx, lr->chunk);
+			js_free(ctx, lr->line);
+			js_free(ctx, lr);
+			return JS_EXCEPTION;
+		}
+		/* The window is bigger than the input buffer, so the peek is split:
+		 * what fits goes to the inflater, and the file is rewound to just after
+		 * it so nothing is skipped. */
+		size_t take = lr->chunk_len < TINJS_GZ_IN ? lr->chunk_len : TINJS_GZ_IN;
+		memcpy(lr->gz->in, lr->chunk, take);
+		lr->gz->in_len = take;
+		if (take < lr->chunk_len) fseek(f, (long)take, SEEK_SET);
+		lr->chunk_len = 0;
+	}
 
 	JSValue obj = JS_NewObjectClass(ctx, tinjs_line_reader_class_id);
 	if (JS_IsException(obj)) {
@@ -582,10 +1063,28 @@ static int install_hooks(JSContext *ctx, int argc, char **argv)
 	JS_SetPropertyStr(ctx, tin, "read", JS_NewCFunction(ctx, js_read, "read", 1));
 	JS_SetPropertyStr(ctx, tin, "readBytes", JS_NewCFunction(ctx, js_read_bytes, "readBytes", 3));
 	JS_SetPropertyStr(ctx, tin, "stat", JS_NewCFunction(ctx, js_stat, "stat", 1));
+	JS_SetPropertyStr(ctx, tin, "readdir", JS_NewCFunction(ctx, js_readdir, "readdir", 1));
+	JS_SetPropertyStr(ctx, tin, "readlink", JS_NewCFunction(ctx, js_readlink, "readlink", 1));
 	JS_SetPropertyStr(ctx, tin, "openLines", JS_NewCFunction(ctx, js_open_lines, "openLines", 1));
 	JS_SetPropertyStr(ctx, tin, "nextLine", JS_NewCFunction(ctx, js_next_line, "nextLine", 1));
 	JS_SetPropertyStr(ctx, tin, "closeLines", JS_NewCFunction(ctx, js_close_lines, "closeLines", 1));
 	JS_SetPropertyStr(ctx, tin, "exit", JS_NewCFunction(ctx, js_exit, "exit", 1));
+
+	// The pure ones: a buffer in, a value out, and nothing else touched.
+	JS_SetPropertyStr(ctx, tin, "md5",
+	                  JS_NewCFunctionMagic(ctx, js_digest, "md5", 1, JS_CFUNC_generic_magic, 0));
+	JS_SetPropertyStr(ctx, tin, "sha1",
+	                  JS_NewCFunctionMagic(ctx, js_digest, "sha1", 1, JS_CFUNC_generic_magic, 1));
+	JS_SetPropertyStr(ctx, tin, "sha256",
+	                  JS_NewCFunctionMagic(ctx, js_digest, "sha256", 1, JS_CFUNC_generic_magic, 2));
+	JS_SetPropertyStr(ctx, tin, "crc32",
+	                  JS_NewCFunctionMagic(ctx, js_checksum, "crc32", 1, JS_CFUNC_generic_magic, 0));
+	JS_SetPropertyStr(ctx, tin, "adler32",
+	                  JS_NewCFunctionMagic(ctx, js_checksum, "adler32", 1, JS_CFUNC_generic_magic, 1));
+	JS_SetPropertyStr(ctx, tin, "utf8Encode", JS_NewCFunction(ctx, js_utf8_encode, "utf8Encode", 1));
+	JS_SetPropertyStr(ctx, tin, "utf8Decode", JS_NewCFunction(ctx, js_utf8_decode, "utf8Decode", 1));
+	JS_SetPropertyStr(ctx, tin, "deflate", JS_NewCFunction(ctx, js_deflate, "deflate", 3));
+	JS_SetPropertyStr(ctx, tin, "inflate", JS_NewCFunction(ctx, js_inflate, "inflate", 2));
 
 	JSValue args = JS_NewArray(ctx);
 	for (int i = 0; i < argc; i++)
@@ -702,8 +1201,17 @@ static void usage(FILE *out)
 	        "  readBytes(path)    file contents as a Uint8Array\n"
 	        "  readBytes(path, offset, length)\n"
 	        "                     length bytes starting at offset, not the whole file\n"
-	        "  stat(path)         { size, mtime, isDirectory, isFile }\n"
-	        "  lines(path)        iterate the file a line at a time\n"
+	        "  stat(path)         { size, mtime, isDirectory, isFile, isSymlink }\n"
+	        "  readdir(path)      [{ name, isDirectory, isFile, isSymlink }], sorted\n"
+	        "  walk(path)         every entry below path, recursively, as { path, ... }\n"
+	        "  readlink(path)     where a symlink points\n"
+	        "  lines(path)        iterate the file a line at a time (.gz too)\n"
+	        "  deflate/inflate, deflateRaw/inflateRaw, gzip/gunzip\n"
+	        "                     compress and decompress bytes or strings\n"
+	        "  crc32, adler32     checksums, as numbers\n"
+	        "  md5, sha1, sha256  hashes, as hex strings\n"
+	        "  TextEncoder, TextDecoder\n"
+	        "                     utf-8 (and utf-16le/be, latin1 to decode)\n"
 	        "  print(...)         a line on stdout; console.log is the same thing\n"
 	        "  console.error(...) a line on stderr\n"
 	        "  inspect(value)     the string print would have produced\n"

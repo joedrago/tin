@@ -29,13 +29,28 @@ either ECMAScript or one of the ones below.
     read(path)                       file contents as a string
     readBytes(path)                  file contents as a Uint8Array
     readBytes(path, offset, length)  length bytes starting at offset
-    stat(path)                       { size, mtime, isDirectory, isFile }
+    stat(path)                       { size, mtime, isDirectory, isFile, isSymlink }
+    readdir(path)                    [{ name, isDirectory, isFile, isSymlink }], sorted
+    walk(path)                       every entry below path, depth-first, as { path, ... }
+    readlink(path)                   where a symlink points, unresolved
     lines(path)                      the file one line at a time, without holding it
     print(...)                       a line on stdout
     console.log/error                the same, and its stderr counterpart
     inspect(value)                   the string print would have produced
     args                             the arguments after the script
     exit(code)                       stop now
+
+And a handful that only compute — a value in, a value out, nothing touched:
+
+    gzip(data, level) / gunzip(data)       .gz files
+    deflate(data, level) / inflate(data)   zlib streams
+    deflateRaw / inflateRaw                bare deflate, as inside a zip entry
+    md5(data), sha1(data), sha256(data)    hashes, as lowercase hex
+    crc32(data), adler32(data)             checksums, as numbers
+    TextEncoder, TextDecoder               utf-8; utf-16le/be and latin1 to decode
+
+`data` is a string (taken as UTF-8), an `ArrayBuffer`, or any typed array; the
+compressors return a `Uint8Array`. `level` is zlib's 0–9, 6 by default.
 
 Reads are unrestricted, the same as everywhere else in tin: it is all your own
 machine. `read` decodes UTF-8; `readBytes` returns a copy of the bytes, so writing
@@ -72,6 +87,26 @@ if (info.isFile && info.size > 100 << 20) {
 of them `true` for anything `stat` can see at all — it throws instead for a path
 that does not exist, the same as `read` does.
 
+### Finding the files in the first place
+
+`readdir(path)` lists one directory; `walk(path)` is every entry below it, a
+generator so a tree of any size is not held at once:
+
+```js
+let total = 0;
+for (const e of walk("logs")) {
+    if (e.isFile && e.path.endsWith(".log")) total += stat(e.path).size;
+}
+```
+
+Both are sorted by name, so two runs over the same tree print the same thing.
+`isFile` and `isDirectory` describe what a symlink points at, and a link that
+points at nothing is neither. `walk` reports a symlinked directory without
+entering it, which is what keeps a link back up the tree from being a loop, and
+it skips the contents of a subdirectory it cannot list rather than giving up on
+the whole walk. `readlink` throws on Windows, where there is no plain
+equivalent.
+
 ### Walking a file that does not fit
 
 `read` wants the whole file in memory, which stops being reasonable somewhere
@@ -103,9 +138,37 @@ in front of it, so a file with CRLF endings reads the same as one without. A
 last line with no newline after it is still a line, and blank lines come back as
 empty strings rather than being skipped.
 
+A file that begins with gzip's magic bytes is inflated on the way in, so
+`lines("access.log.1.gz")` is the same loop as on the live log, in the same
+constant memory. Concatenated members are followed through, each one's CRC is
+checked, and a truncated or corrupt file throws partway through rather than
+quietly ending early.
+
 There is deliberately no byte-wise counterpart. `lines` exists because logs and
 records are line-oriented; a general streaming API would be a larger surface for
 a case that has not come up.
+
+### Compressed data, hashes and text
+
+The compression functions are zlib's, with Node's names: `gzip`/`gunzip` for
+`.gz` files, `deflate`/`inflate` for the zlib-wrapped stream that HTTP, PNG and
+git objects use, and the `Raw` pair for a bare stream such as a zip entry
+holds. With `readBytes` slices that is enough to read inside an archive without
+unpacking it, which tinjs could not do anyway.
+
+```js
+const head = new TextDecoder().decode(gunzip(readBytes("dump.json.gz"))).slice(0, 200);
+print(sha256(readBytes("release.tar.gz")));
+```
+
+Decompression stops at the same 512 MB ceiling as `read`, so a small file that
+claims to expand to terabytes is an error rather than an allocation. Corrupt
+input and checksum mismatches throw.
+
+`TextDecoder` decodes UTF-8, UTF-16 in either byte order, and `latin1` — which,
+as on the web, means windows-1252. A leading byte-order mark is dropped unless
+`ignoreBOM` is set, and malformed input becomes U+FFFD unless `fatal` is set, in
+which case it throws.
 
 ## What is not in it
 
@@ -177,7 +240,8 @@ at the same size is one number to remember instead of two.
 
 No dependencies, no network, nothing to install. The engine is vendored in
 [`quickjs/`](quickjs/VENDORED.md) — four C files, byte-for-byte from the upstream
-tarball.
+tarball — and compression in [`miniz/`](miniz/VENDORED.md), one more, built with
+its file and zip-archive code compiled out.
 
 ```sh
 cmake -S tinjs -B tinjs/build
@@ -220,9 +284,11 @@ a script cannot see from inside itself: exit codes, the limits, and stderr.
 ## Layout
 
     CMakeLists.txt     builds the engine and one executable, and nothing else
-    src/tinjs.c        the seven hooks, the limits, and the argument handling
+    src/tinjs.c        the hooks, the limits, and the argument handling
+    src/digest.c       MD5, SHA-1 and SHA-256, pure computation
     src/prelude.js     console, inspect and the friendly names, in JavaScript
     quickjs/           vendored engine, minus its host bindings
+    miniz/             vendored deflate/inflate, minus its file and zip code
     test/              the two suites and their fixtures
 
 `src/tinjs.c` is the part that has to be audited, so everything that did not have
