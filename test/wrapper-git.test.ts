@@ -71,9 +71,27 @@ test("subcommands that write anything are refused", () => {
 });
 
 test("top-level options are refused before any subcommand", () => {
-	for (const arg of ["-c", "--exec-path=/tmp", "--git-dir=.git", "-C", "--config-env=x", "-P"]) {
+	for (const arg of ["-c", "--exec-path=/tmp", "--git-dir=.git", "-C/tmp", "--config-env=x", "-P"]) {
 		assert.match(refused(arg, "status"), /top-level git options are not allowed/, arg);
 	}
+});
+
+test("one leading -C reaches another repository, and changes nothing else", () => {
+	assert.deepEqual(allowed("-C", "/tmp/tin-x/3-clone-repo", "log", "--oneline"), [
+		"-C",
+		"/tmp/tin-x/3-clone-repo",
+		"log",
+		"--oneline",
+	]);
+	assert.deepEqual(allowed("-C", "../other", "branch"), ["-C", "../other", "branch", "--list"]);
+	assert.match(refused("-C"), /-C needs a directory/);
+	assert.match(refused("-C", "", "status"), /-C needs a directory/);
+	assert.match(refused("-C", "/tmp"), /allowed subcommands are/);
+	assert.match(refused("-C", "a", "-C", "b", "status"), /top-level git options are not allowed/);
+	assert.match(refused("-C", "a", "--git-dir=x", "status"), /top-level git options are not allowed/);
+	assert.match(refused("-C", "a", "-c", "core.pager=sh", "log"), /top-level git options are not allowed/);
+	assert.match(refused("-C", "a", "commit"), /is not a read-only subcommand/);
+	assert.match(refused("-C", "a", "diff", "--output=/tmp/x"), /not allowed/);
 });
 
 test("nothing runs with no subcommand at all", () => {

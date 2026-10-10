@@ -21,12 +21,19 @@
 // config, or the network is rejected, as is every option that can be talked into
 // running another program.
 //
+// Reads are unrestricted, so this reads any repository on the drive: one leading
+// "-C <dir>" is the only top-level option let through. tin_run keeps its own cwd inside
+// the write roots, so this is how git reaches a tin_clone, or a repository next door.
+//
 // What this does not do: it does not contain git once git is running. The named config
-// hooks are turned off below, but a diff driver you have defined yourself — a textconv
-// or a clean filter in your own gitconfig — is still selected by a .gitattributes file,
-// and .gitattributes is inside the workspace where the model may write. If you have
-// such a driver configured, that program is reachable. The config itself is not: tin
-// keeps the model out of .git and out of your home.
+// hooks are turned off below, but a diff driver or a clean filter defined in config is
+// still selected by a .gitattributes file — one in the workspace, where the model may
+// write, or one that arrived in a clone. Your own gitconfig is the config that matters
+// there: if you have such a driver, that program is reachable. So is one defined in the
+// .git/config of a repository someone else put on your drive, which -C can now reach —
+// an unpacked tarball with its .git still in it, say. Repositories you made, and ones
+// tin_clone made (git writes that config itself), have nothing of the sort. The model
+// can write no config of its own: tin keeps it out of .git and out of your home.
 //
 // Keep this and `wrappers/git` in step. They are one policy in two languages, and a
 // rule added to one of them is missing from the other until it is added there too.
@@ -194,6 +201,15 @@ function checkListingOnly(sub, args) {
  * Returns the subcommand and arguments to pass on, or throws Refused.
  */
 export function gitPolicy(argv) {
+	// Exactly "-C <dir>", as two arguments, and only first. Changing directory is all it
+	// does; the subcommand and its options are checked below just the same.
+	let where = [];
+	if (argv[0] === "-C") {
+		if (argv.length < 2 || argv[1] === "") refuse("-C needs a directory as the next argument.");
+		where = ["-C", argv[1]];
+		argv = argv.slice(2);
+	}
+
 	if (argv.length < 1) usage();
 
 	const sub = argv[0];
@@ -202,7 +218,7 @@ export function gitPolicy(argv) {
 	if (sub.startsWith("-")) {
 		refuse(
 			"top-level git options are not allowed (they can set config, aliases, or the pager). " +
-				"Start with a subcommand; use tin_run's cwd to change directory.",
+				'Start with a subcommand, after a single "-C <dir>" if it is another repository.',
 		);
 	}
 	if (!SUBCOMMANDS.has(sub)) usage(`"${sub}" is not a read-only subcommand.\n`);
@@ -248,7 +264,7 @@ export function gitPolicy(argv) {
 			checkArgs(args);
 	}
 
-	return [sub, ...args];
+	return [...where, sub, ...args];
 }
 
 // --- run it ---------------------------------------------------------------------

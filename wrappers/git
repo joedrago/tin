@@ -14,12 +14,21 @@
 # tree, the config, or the network is rejected, as is every option that can be
 # talked into running another program.
 #
+# Reads are unrestricted, so this reads any repository on the drive: one leading
+# "-C <dir>" is the only top-level option let through. tin_run keeps its own cwd
+# inside the write roots, so this is how git reaches a tin_clone, or a repository
+# next door.
+#
 # What this does not do: it does not contain git once git is running. The named
-# config hooks are turned off below, but a diff driver you have defined yourself —
-# a textconv or a clean filter in your own ~/.gitconfig — is still selected by a
-# .gitattributes file, and .gitattributes is inside the workspace where the model
-# may write. If you have such a driver configured, that program is reachable. The
-# config itself is not: tin keeps the model out of .git and out of your home.
+# config hooks are turned off below, but a diff driver or a clean filter defined in
+# config is still selected by a .gitattributes file — one in the workspace, where
+# the model may write, or one that arrived in a clone. Your own gitconfig is the
+# config that matters there: if you have such a driver, that program is reachable.
+# So is one defined in the .git/config of a repository someone else put on your
+# drive, which -C can now reach — an unpacked tarball with its .git still in it,
+# say. Repositories you made, and ones tin_clone made (git writes that config
+# itself), have nothing of the sort. The model can write no config of its own:
+# tin keeps it out of .git and out of your home.
 
 set -eu
 
@@ -132,6 +141,17 @@ check_args() {
 	done
 }
 
+# --- where ----------------------------------------------------------------------
+
+# Exactly "-C <dir>", as two arguments, and only first. Changing directory is all
+# it does; the subcommand and its options are checked below just the same.
+dir=""
+if [ "${1-}" = "-C" ]; then
+	[ $# -ge 2 ] && [ -n "$2" ] || die "-C needs a directory as the next argument."
+	dir=$2
+	shift 2
+fi
+
 # --- the subcommand -------------------------------------------------------------
 
 [ $# -ge 1 ] || usage
@@ -140,7 +160,7 @@ sub=$1
 shift
 
 case "$sub" in
--*) die "top-level git options are not allowed (they can set config, aliases, or the pager). Start with a subcommand; use tin_run's cwd to change directory." ;;
+-*) die "top-level git options are not allowed (they can set config, aliases, or the pager). Start with a subcommand, after a single \"-C <dir>\" if it is another repository." ;;
 esac
 
 if ! in_list "$sub" "$SUBCOMMANDS"; then
@@ -194,6 +214,12 @@ esac
 
 # --- run it ---------------------------------------------------------------------
 
+if [ -n "$dir" ]; then
+	set -- -C "$dir" "$sub" "$@"
+else
+	set -- "$sub" "$@"
+fi
+
 # Anything git might read out of the environment and turn into a program. tin passes
 # your environment through, so these arrive if you have them set and this list is the
 # thing that stops them. GIT_EXEC_PATH is the one to notice: it names the directory git
@@ -228,4 +254,4 @@ exec "$GIT" \
 	-c protocol.ext.allow=never \
 	-c uploadpack.packObjectsHook= \
 	--no-pager --no-optional-locks \
-	"$sub" "$@"
+	"$@"

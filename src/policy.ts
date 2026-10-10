@@ -1,5 +1,6 @@
 import path from "node:path";
 import type { TinPolicy } from "./config.ts";
+import { TIN_CLONE, TIN_FETCH } from "./net.ts";
 import { canonicalize, isInside, segmentsWithin } from "./paths.ts";
 
 /** Tools that only observe the filesystem. Unrestricted: it is all local anyway. */
@@ -11,9 +12,13 @@ export const SHELL_TOOLS = new Set(["bash", "powershell"]);
 
 export const TIN_RUN = "tin_run";
 
+/** Tools that reach the network: GET-only, approved per host, results in the capture directory. */
+export const NET_TOOLS = new Set([TIN_FETCH, TIN_CLONE]);
+
 /** The complete set tin exposes to the model, in the order it reads best. */
 export function allowedToolNames(policy: TinPolicy): string[] {
-	return [...READ_TOOLS, ...WRITE_TOOLS, TIN_RUN, ...policy.allowTools];
+	const net = policy.net.enabled ? [...NET_TOOLS] : [];
+	return [...READ_TOOLS, ...WRITE_TOOLS, TIN_RUN, ...net, ...policy.allowTools];
 }
 
 export type Decision = { allow: true } | { allow: false; reason: string };
@@ -88,6 +93,9 @@ export function decideToolCall(
 	}
 
 	if (toolName === TIN_RUN) return allow; // tin_run validates its own arguments.
+
+	// Like tin_run, these check their own arguments, and ask the user what to ask.
+	if (NET_TOOLS.has(toolName) && policy.net.enabled) return allow;
 
 	return deny(
 		`tin: the ${toolName} tool is not part of tin's allowed set. ` +

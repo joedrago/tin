@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { canonicalize, expandTilde, isInside } from "./paths.ts";
@@ -40,6 +40,24 @@ export interface TinConfigFile {
 		/** Environment variables set explicitly on the child, applied last either way. */
 		env?: Record<string, string>;
 	};
+	net?: {
+		/** Whether tin_fetch and tin_clone exist at all. Default true. */
+		enabled?: boolean;
+
+		// Hosts reached without asking: `example.com`, `*.example.com` for its
+		// subdomains, and `host:port` for anything off the scheme's default port.
+		// Setting it replaces the built-in list rather than adding to it.
+		allowHosts?: string[];
+		/** Hosts refused without asking, written the same way. Wins over allowHosts. */
+		denyHosts?: string[];
+
+		/** How long a question waits for an answer before it counts as nobody there. */
+		askTimeoutMs?: number;
+		/** How long one fetch or clone may take, prompts aside. */
+		timeoutMs?: number;
+		/** Ceiling on one fetched file. */
+		maxFetchBytes?: number;
+	};
 }
 
 export interface TinExecPolicy {
@@ -53,6 +71,15 @@ export interface TinExecPolicy {
 	passEnv: string[];
 
 	env: Record<string, string>;
+}
+
+export interface TinNetPolicy {
+	enabled: boolean;
+	allowHosts: string[];
+	denyHosts: string[];
+	askTimeoutMs: number;
+	timeoutMs: number;
+	maxFetchBytes: number;
 }
 
 export interface TinPolicy {
@@ -79,6 +106,7 @@ export interface TinPolicy {
 	/** Extra tool names allowed through the gate. */
 	allowTools: string[];
 	exec: TinExecPolicy;
+	net: TinNetPolicy;
 	configPath: string;
 	/** Problems worth telling the user about at session start. */
 	warnings: string[];
@@ -141,6 +169,44 @@ const DEFAULT_EXEC: TinExecPolicy = {
 	passEnv: DEFAULT_PASS_ENV,
 
 	env: {},
+};
+
+/**
+ * Hosts tin_fetch and tin_clone reach without asking.
+ *
+ * Kept to places a model fetches from for ordinary reasons — GitHub, including the
+ * hosts its downloads redirect to, and the main package registries — and where a
+ * plain GET is all the request ever is. Being on this list is about where a request
+ * goes, not what it says: a URL that looks like it is carrying data is asked about
+ * wherever it is headed.
+ */
+export const DEFAULT_ALLOW_HOSTS = [
+	"github.com",
+	"api.github.com",
+	"raw.githubusercontent.com",
+	"gist.githubusercontent.com",
+	"codeload.github.com",
+	"objects.githubusercontent.com",
+	"release-assets.githubusercontent.com",
+	"registry.npmjs.org",
+	"pypi.org",
+	"files.pythonhosted.org",
+	"crates.io",
+	"static.crates.io",
+	"docs.rs",
+];
+
+const DEFAULT_NET: TinNetPolicy = {
+	enabled: true,
+	allowHosts: DEFAULT_ALLOW_HOSTS,
+	denyHosts: [],
+
+	// Long enough to notice a prompt and read the URL in it, short enough that a
+	// session left alone is not stalled for long by every request it makes.
+	askTimeoutMs: 60_000,
+
+	timeoutMs: 120_000,
+	maxFetchBytes: 100 * 1024 ** 2,
 };
 
 export interface BuildPolicyOptions {
@@ -324,6 +390,27 @@ export function buildPolicy(options: BuildPolicyOptions): TinPolicy {
 		env: typeof file.exec?.env === "object" && file.exec.env ? file.exec.env : {},
 	};
 
+	const allowHosts = stringArray(file.net?.allowHosts);
+	if (file.net?.allowHosts !== undefined && allowHosts === undefined) {
+		warnings.push(`${configPath}: net.allowHosts must be an array of strings — using the built-in list`);
+	}
+	// A malformed deny list cannot be honoured, and falling back to an empty one would
+	// quietly reach hosts the user meant to refuse, so the network goes off instead.
+	const denyHosts = stringArray(file.net?.denyHosts);
+	const denyHostsBroken = file.net?.denyHosts !== undefined && denyHosts === undefined;
+	if (denyHostsBroken) {
+		warnings.push(`${configPath}: net.denyHosts must be an array of strings — network access disabled`);
+	}
+	const net: TinNetPolicy = {
+		enabled:
+			!denyHostsBroken && (typeof file.net?.enabled === "boolean" ? file.net.enabled : DEFAULT_NET.enabled),
+		allowHosts: [...(allowHosts ?? DEFAULT_NET.allowHosts)],
+		denyHosts: [...(denyHosts ?? DEFAULT_NET.denyHosts)],
+		askTimeoutMs: positiveNumber(file.net?.askTimeoutMs, DEFAULT_NET.askTimeoutMs),
+		timeoutMs: positiveNumber(file.net?.timeoutMs, DEFAULT_NET.timeoutMs),
+		maxFetchBytes: positiveNumber(file.net?.maxFetchBytes, DEFAULT_NET.maxFetchBytes),
+	};
+
 	return {
 		workspace,
 		writeRoots,
@@ -335,7 +422,55 @@ export function buildPolicy(options: BuildPolicyOptions): TinPolicy {
 		execEnabled,
 		allowTools: stringArray(file.allowTools) ?? [],
 		exec,
+		net,
 		configPath,
 		warnings,
 	};
+}
+
+/**
+ * Add a host to net.allowHosts or net.denyHosts in tin.json, for an "Always allow"
+ * or "Always deny" answer.
+ *
+ * tin is the one writing here, on the user's say-so from a prompt; the model still
+ * has no way to reach this file. Everything else in it is left as it was. When the
+ * file has no such list of its own, the list written out is the one in force plus
+ * the new host — for allowHosts that is the built-in hosts, since a list in the
+ * file replaces the built-in one and writing the new host alone would quietly drop
+ * the rest.
+ *
+ * The file is rewritten in place rather than renamed over, so a tin.json that is a
+ * symlink into someone's dotfiles stays one.
+ */
+export function saveHostEntry(
+	configPath: string,
+	list: "allowHosts" | "denyHosts",
+	entry: string,
+	inForce: string[],
+): void {
+	let raw: string | undefined;
+	try {
+		raw = readFileSync(configPath, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+
+	const file: unknown = raw === undefined ? {} : JSON.parse(raw);
+	if (!file || typeof file !== "object" || Array.isArray(file)) {
+		throw new Error(`${configPath} is not a JSON object`);
+	}
+	const config = file as Record<string, unknown>;
+	const net = config.net ?? {};
+	if (!net || typeof net !== "object" || Array.isArray(net)) {
+		throw new Error(`${configPath}: net is not an object`);
+	}
+
+	const hosts = stringArray((net as Record<string, unknown>)[list]) ?? [...inForce];
+	if (!hosts.includes(entry)) hosts.push(entry);
+	config.net = { ...net, [list]: hosts };
+
+	// Keep whatever indentation the file was written with.
+	const indent = raw?.match(/^([ \t]+)\S/m)?.[1] ?? "  ";
+	mkdirSync(path.dirname(configPath), { recursive: true });
+	writeFileSync(configPath, `${JSON.stringify(config, null, indent)}\n`);
 }

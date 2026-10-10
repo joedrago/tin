@@ -461,19 +461,29 @@ class CaptureFile {
 }
 
 /**
- * Create the capture directory if this session has not captured yet, and name the
- * file this run will write to.
- *
- * mkdir rather than a recursive create: the parent is the OS temp directory,
- * which is shared, and a plain mkdir fails if anything is already at the name
- * instead of following it somewhere else. 0700 keeps the contents to the user
- * whose output it is.
+ * Name the file this run will capture its stdout to.
  *
  * The name carries a sequence number and the command, which are for the person
  * reading `ls` later; the command name has already been through COMMAND_NAME, so
  * it holds no separator and cannot climb out of the directory.
  */
 export function nextCapturePath(policy: TinPolicy, command: string): string {
+	return nextCaptureEntry(policy, `${command}.out`);
+}
+
+/**
+ * Create the capture directory if this session has not used it yet, and name the
+ * next entry in it. tin_fetch and tin_clone put their results here as well, under
+ * the same numbering, which is what keeps those off the write roots too.
+ *
+ * mkdir rather than a recursive create: the parent is the OS temp directory,
+ * which is shared, and a plain mkdir fails if anything is already at the name
+ * instead of following it somewhere else. 0700 keeps the contents to the user
+ * whose output it is.
+ *
+ * `label` must already be a bare file name; callers sanitize it.
+ */
+export function nextCaptureEntry(policy: TinPolicy, label: string): string {
 	try {
 		mkdirSync(policy.captureDir, { mode: 0o700 });
 	} catch (error) {
@@ -484,7 +494,7 @@ export function nextCapturePath(policy: TinPolicy, command: string): string {
 		}
 	}
 	captureSequence += 1;
-	return path.join(policy.captureDir, `${captureSequence}-${command}.out`);
+	return path.join(policy.captureDir, `${captureSequence}-${label}`);
 }
 
 /** Start the run numbering over. Called when a session starts, and by tests. */
@@ -678,7 +688,7 @@ export function execCommand(
 /** How many lines of a capture file to show, as an idea of what landed in it. */
 const CAPTURE_PREVIEW_LINES = 30;
 
-function describeBytes(bytes: number): string {
+export function describeBytes(bytes: number): string {
 	if (bytes < 1024) return `${bytes} B`;
 	const units = ["KB", "MB", "GB", "TB"];
 	let value = bytes / 1024;

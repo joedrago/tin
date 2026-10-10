@@ -10,6 +10,7 @@ smaller one, so you can point a local model at a directory and walk away.
 | **Read** | Anywhere. `read`, `ls`, `grep` and `find` are untouched — it is all your own machine. |
 | **Write** | Only inside the workspace. Symlinks are resolved first, so a link out of the tree is not a way out. |
 | **Execute** | Only what you have symlinked into `~/tinbin`, run directly with an argument array. There is no shell. |
+| **Network** | A plain GET or a shallow clone, into a file tin chooses. Any host you have not listed is asked about first. |
 | **Everything else** | Denied. Tools tin does not recognize — including ones a future pi version adds — are unavailable until you say otherwise. |
 
 `bash` and `powershell` are not gated, they are gone: the model never sees them in its tool
@@ -211,9 +212,15 @@ to `list` and `show`, `worktree` to `list`, `remote` to `remote -v`.
 The rest of the script is about the options, because git has a lot of ways to turn a read
 into an exec:
 
-- **Top-level options are refused outright.** `-c` sets any config key — a pager, an
-  alias, an external diff — and `--exec-path`, `--git-dir` and `--config-env` are no
-  better. Use `tin_run`'s `cwd` instead of `git -C`.
+- **Top-level options are refused outright, except one leading `-C <dir>`.** `-c` sets
+  any config key — a pager, an alias, an external diff — and `--exec-path`, `--git-dir`
+  and `--config-env` are no better. `-C` only changes directory, and reads are
+  unrestricted, so `git -C ../other log` and `git -C <a tin_clone> diff` work from
+  anywhere; `tin_run`'s own `cwd` stays inside the write roots. The one thing to know
+  about reaching *any* repository: git trusts a repository's own `.git/config`, and a
+  diff or filter driver defined there runs when you diff or check status in it. Yours,
+  and ones `tin_clone` made, define none; one someone else put on your drive with its
+  `.git` intact could.
 - **Options that name a file to write or a program to run are refused**, including
   through abbreviations. Git expands any unambiguous prefix, so `--open-f=/bin/sh`
   really does reach `--open-files-in-pager`; the check compares prefixes in both
@@ -355,6 +362,85 @@ Some details that matter:
   it is a backstop against a runaway rather than a limit you work around. In practice
   `exec.timeoutMs` stops most things long before it.
 
+## Network: `tin_fetch` and `tin_clone`
+
+A model working on code wants the documentation for the library it is calling,
+or the source of it, constantly. Two tools make that possible without handing over
+a network client:
+
+```
+tin_fetch { url: "https://raw.githubusercontent.com/owner/repo/main/README.md" }
+tin_clone { url: "https://github.com/owner/repo", branch: "v2" }
+```
+
+Each gives back a path and nothing else to do with: the fetched file or the cloned
+directory, under the [capture directory](#capturing-output), never in the
+workspace. A fetch also says its status, content type and size, and the final URL
+if it was redirected. Neither tool takes anything that would turn it into a
+general client — no method, no headers, no body, no git options.
+
+The goal is not to keep the model off the network. It is that nothing it does there
+is destructive or leaks what it has read, and the shape of both tools follows from
+that:
+
+- **A fetch is a GET, carrying a Chrome user agent and nothing else.** No cookies,
+  no `Authorization`, no `Referer`, no proxy. A URL with `user:password@` in it is
+  refused. Redirects are followed by tin, up to five, so each one is checked like
+  the original.
+- **A clone is anonymous, shallow, and http(s) only.** It runs the real `git` off
+  your `PATH` — not the read-only wrapper — with none of your git configuration:
+  no credential helper quietly using your GitHub token, no `insteadOf` turning https
+  into ssh and your agent, no global hooks or filters. `ext::`, `file://` and ssh are
+  refused at the protocol level, redirects are not followed, submodules are never
+  fetched, and symlinks are checked out as plain files. Only the URL and an optional
+  branch or tag come from the model, after `--` and in the `=` form.
+
+### Hosts, and asking
+
+Every request is to a *host* — the name or IP address in the URL, plus `:port`
+when it is not the scheme's default. The ones on `net.allowHosts` go through without
+asking; by default that is GitHub (including the hosts its downloads redirect to)
+and the main package registries. The ones on `net.denyHosts` are refused without
+asking. For anything else, tin asks:
+
+```
+tin_fetch wants to reach a host that is not on your allowed list: docs.example.com
+
+  GET https://docs.example.com/guide/install.md
+
+  > Allow once
+    Allow docs.example.com for this session
+    Always allow docs.example.com (adds it to tin.json)
+    Deny
+    Always deny docs.example.com (adds it to tin.json)
+```
+
+An IP address is a host like any other. `localhost`, `192.168.1.5:8080` and
+`169.254.169.254` are not on the list, so they are asked about, and denying one you
+do not recognise is the whole of the protection against the model poking at your
+own network.
+
+The two "Always" answers write to `tin.json` for you, keeping everything else in
+it as it was. A plain "Deny" holds for the rest of the session, so you are not asked
+twice.
+
+**A URL that looks like it is carrying data is asked about too**, wherever it is
+going: a long run of base64 or hex in the path or query, something shaped like a
+key or token, a hostname long enough to be a DNS tunnel. Only once or deny, for
+that request alone. This is a speed bump rather than a wall — a model patient enough
+to send a secret forty characters at a time gets past it — but the careless shape
+is the one a prompt-injected model actually produces, and this puts it in front of
+you first. Query strings are otherwise sent as written: `?raw=true` and
+`?per_page=100` are ordinary, and data fits in a path just as well.
+
+**Nobody answering is not the same as no.** Each question waits
+`net.askTimeoutMs` (a minute) and then gives up, and the model is told that you
+did not answer rather than that you refused: that you have probably stepped away,
+that it should carry on with what does not depend on the request, and that it
+should say at the end what is waiting for you. A session you walked away from
+stalls for a minute per unlisted host, and then gets on without them. With no UI at
+all, unlisted hosts are simply not reached.
+
 ## Windows
 
 The allowlist directory is `%USERPROFILE%\tinbin`, and everything above still holds, but
@@ -415,6 +501,14 @@ falls back to those defaults rather than to something more permissive.
     "inheritEnv": true,
     "passEnv": ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TMPDIR"],
     "env": {}
+  },
+  "net": {
+    "enabled": true,
+    "allowHosts": ["github.com", "raw.githubusercontent.com", "..."],
+    "denyHosts": [],
+    "askTimeoutMs": 60000,
+    "timeoutMs": 120000,
+    "maxFetchBytes": 104857600
   }
 }
 ```
@@ -438,6 +532,17 @@ falls back to those defaults rather than to something more permissive.
   process gets](#what-the-child-process-gets) for why, and for when to turn it off.
 - **`exec.passEnv`** — the variables carried over when `inheritEnv` is false. Ignored
   otherwise.
+- **`net.enabled`** — false takes [`tin_fetch` and `tin_clone`](#network-tin_fetch-and-tin_clone)
+  away entirely.
+- **`net.allowHosts`** and **`net.denyHosts`** — hosts reached, and refused, without
+  asking: `example.com` for that host alone, `*.example.com` for everything under it,
+  `host:port` off the default port. Deny wins when a host is on both. Setting
+  `allowHosts` replaces the built-in list, and the first "Always allow" writes the
+  built-in list out along with the new host so nothing is dropped. A `denyHosts`
+  that is not a list of strings turns the network off rather than being ignored.
+- **`net.askTimeoutMs`** — how long a question waits before it counts as nobody there.
+- **`net.timeoutMs`** and **`net.maxFetchBytes`** — bounds on one fetch or clone,
+  not counting time spent waiting on a question.
 
 One setting also has an environment variable, `TIN_EXTRA_WRITE_ROOTS`: a delimiter-separated
 list of directories, in the shape of `PATH`, *added* to whatever `writeRoots` resolved to
@@ -533,9 +638,15 @@ tin is a policy layer inside the pi process. It is not an OS sandbox, and pi's o
 
 - **The commands you allow are trusted completely.** Once `git` runs, it runs as you, with
   your files. tin decides *what* may start, not what it does afterwards.
-- **Reads are unrestricted by design.** A model that can read `~/.ssh` and then run an
-  allowed command that talks to the network can move data out. If that matters for your
-  threat model, do not link a network tool.
+- **Reads are unrestricted by design, and the network is not closed.** A model that can
+  read `~/.ssh` and then reach a host can move data out — through `tin_fetch` to a host
+  you allowed, or through anything in `~/tinbin` that talks to the network. tin asks
+  before any host you have not listed and flags the obvious shapes of data in a URL,
+  which catches the careless attempt, not a patient one. If that matters for your threat
+  model, set `net.enabled` to false and do not link a network tool.
+- **An allowed host is trusted with its name.** tin decides by the host in the URL and
+  lets the system resolve it, so a name you allowed that resolves to `127.0.0.1` reaches
+  `127.0.0.1`. The built-in list is hosts where that is not a realistic concern.
 - **It does not contain other extensions.** Anything else you load runs with full
   permissions and could remove tin's handlers.
 - **`!` commands are yours.** Shell commands you type yourself are not gated — you are not
@@ -566,6 +677,7 @@ its own terms, described in [`tinjs/README.md`](tinjs/README.md#building).
 
 The interesting logic is deliberately free of pi imports so it can be tested directly:
 `src/paths.ts` (canonicalization and containment), `src/policy.ts` (the gate),
-`src/config.ts` (policy resolution), `src/run.ts` (allowlist and execution).
+`src/config.ts` (policy resolution), `src/run.ts` (allowlist and execution),
+`src/net.ts` (the host lists, the questions, fetch and clone).
 `src/index.ts` is only the wiring, and `bin/tin` is a standalone launcher that knows
 nothing about tin beyond the name of one environment variable.
